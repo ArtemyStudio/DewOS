@@ -33,7 +33,7 @@ copy_bin_with_libs() {
   cp "$bin" "$dest"
   chmod +x "$dest"
 
-  ldd "$bin" 2>/dev/null | while read -r line; do
+  (ldd "$bin" 2>/dev/null || true) | while read -r line; do
     local lib=""
 
     case "$line" in
@@ -51,11 +51,12 @@ copy_bin_with_libs() {
 echo "[DewOS] Building initramfs tree..."
 rm -rf "$ROOT"
 mkdir -p "$ROOT"/{bin,sbin,etc,proc,sys,dev,tmp,root,home,mnt,var,run,usr/bin,usr/sbin,lib,lib64}
+mkdir -p "$ROOT/boot"
 mkdir -p out
 
 echo "[DewOS] Building /init..."
 g++ -std=c++20 -Wall -Wextra -O2 -static \
-  app/init/init.cpp app/init/shell.cpp app/init/system.cpp \
+  app/init/init.cpp app/init/shell.cpp app/init/system.cpp app/init/network.cpp \
   -o "$INIT_BIN" -lcrypt
 chmod +x "$INIT_BIN"
 
@@ -67,6 +68,7 @@ for app in \
   ash sh echo printf cat head tail ls pwd mkdir rmdir rm cp mv touch chmod chown \
   grep sed awk find xargs test true false clear reset sleep date uname hostname \
   whoami id ps kill dmesg free top mount umount sync df du ifconfig ip route \
+  blockdev mknod stty \
   ping wget udhcpc vi hexdump cut sort uniq wc tr basename dirname reboot poweroff halt
 do
   ln -sf /bin/busybox "$ROOT/bin/$app" 2>/dev/null || true
@@ -76,15 +78,47 @@ done
 echo "[DewOS] Adding installer tools..."
 for cmd in \
   /usr/bin/lsblk /usr/sbin/fdisk /usr/sbin/partprobe /usr/sbin/blkid \
-  /usr/sbin/mkfs.ext4 /usr/bin/udevadm /usr/bin/openssl \
+  /usr/sbin/mkfs.ext4 /usr/sbin/mkfs.vfat /usr/bin/udevadm /usr/bin/openssl \
   /usr/sbin/wpa_supplicant /usr/bin/wpa_passphrase /usr/sbin/iw /usr/sbin/rfkill
 do
   copy_bin_with_libs "$cmd"
 done
 
-if [ -f "$INSTALLER_SRC" ]; then
+for cmd in /usr/bin/grub-* /usr/sbin/grub-*; do
+  copy_bin_with_libs "$cmd"
+done
+
+if [ -f app/installer/dew-install ]; then
+  cp app/installer/dew-install "$INSTALLER_BIN"
+  chmod +x "$INSTALLER_BIN"
+elif [ -f "$INSTALLER_SRC" ]; then
   cp "$INSTALLER_SRC" "$INSTALLER_BIN"
   chmod +x "$INSTALLER_BIN"
+fi
+
+if [ -d build/rootfs-disk ]; then
+  echo "[DewOS] Adding installable rootfs template..."
+  mkdir -p "$ROOT/rootfs-disk"
+  (
+    cd build/rootfs-disk
+    find . -path ./dev -prune -o -print0 | cpio --quiet --null -pdm "../../$ROOT/rootfs-disk"
+  )
+  mkdir -p "$ROOT/rootfs-disk/dev"
+fi
+
+if [ -f out/bzImage ]; then
+  cp out/bzImage "$ROOT/boot/vmlinuz-dewos"
+fi
+
+if [ -d /usr/lib/grub ]; then
+  echo "[DewOS] Adding GRUB runtime..."
+  mkdir -p "$ROOT/usr/lib"
+  cp -a /usr/lib/grub "$ROOT/usr/lib/"
+fi
+
+if [ -d /usr/share/grub ]; then
+  mkdir -p "$ROOT/usr/share"
+  cp -a /usr/share/grub "$ROOT/usr/share/"
 fi
 
 if [ -f assets/boot-logo.png ] || [ -f assets/boot-logo.ppm ]; then

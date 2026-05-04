@@ -1,5 +1,6 @@
 #include "../include/shell.hpp"
 #include "../include/system.hpp"
+#include "../include/network.hpp"
 #include "../include/colors.hpp"
 #include "../include/init.hpp"
 
@@ -100,6 +101,11 @@ std::vector<Command> create_commands() {
     commands.push_back(Command{"umount", "Unmount path", cmd_umount});
     commands.push_back(Command{"su", "Switch user", cmd_su});
     commands.push_back(Command{"netlog", "Show network startup log", cmd_netlog});
+    commands.push_back(Command{"wifi-detect", "Detect Wi-Fi interfaces and tools", cmd_wifi_detect});
+    commands.push_back(Command{"wifi-scan", "Scan Wi-Fi networks", cmd_wifi_scan});
+    commands.push_back(Command{"wifi-connect-debug", "Connect Wi-Fi with debug output", cmd_wifi_connect_debug});
+    commands.push_back(Command{"net-test", "Run network connectivity checks", cmd_net_test});
+    commands.push_back(Command{"network", "Network status, scan, DHCP and debug connect", cmd_network});
 
     return commands;
 }
@@ -463,13 +469,13 @@ void cmd_dewfetch(const CommandContext& ctx) {
         std::string(LIGHT_BLUE) + "             .:-=+*░▒▓" + BLUE + "████████████▄           " + RESET,
         std::string(LIGHT_BLUE) + "                .-=*▒▓" + BLUE + "██████████████▄         " + RESET,
         std::string(LIGHT_BLUE) + "                    .:+▓" + BLUE + "████████████▓▓       " + RESET,
-        std::string(BLUE)       + "                              ▐████████▌      " + RESET,
-        std::string(BLUE)       + "                                ▐████████▌    " + RESET,
-        std::string(BLUE)       + "                                  ▐███████▌   " + RESET,
-        std::string(BLUE)       + "                                    ▐██████▌  " + RESET,
-        std::string(BLUE)       + "                                  ▄███████▀   " + RESET,
-        std::string(BLUE)       + "                                ▄████████▀    " + RESET,
-        std::string(BLUE)       + "                              ▄████████▀      " + RESET,
+        std::string(BLUE)       + "                               ▐████████▌      " + RESET,
+        std::string(BLUE)       + "                                  ▐████████▌    " + RESET,
+        std::string(BLUE)       + "                                    ▐███████▌   " + RESET,
+        std::string(BLUE)       + "                                      ▐██████▌  " + RESET,
+        std::string(BLUE)       + "                                    ▄███████▀   " + RESET,
+        std::string(BLUE)       + "                                  ▄████████▀    " + RESET,
+        std::string(BLUE)       + "                                ▄████████▀      " + RESET,
         std::string(LIGHT_BLUE) + "                    .:+▓" + BLUE + "██████████████▀       " + RESET,
         std::string(LIGHT_BLUE) + "                .-=*▒▓" + BLUE + "██████████████▀         " + RESET,
         std::string(LIGHT_BLUE) + "             .:-=+*░▒▓" + BLUE + "████████████▀           " + RESET,
@@ -858,7 +864,42 @@ void start_network_if_installed() {
         return;
     }
 
-    if (access("/sbin/netup", X_OK) != 0) {
+    std::string network_type = "ethernet";
+    std::string iface = "eth0";
+    std::ifstream config("/etc/dewos/network.conf");
+
+    if (config.is_open()) {
+        std::string line;
+
+        while (std::getline(config, line)) {
+            size_t eq = line.find('=');
+
+            if (eq == std::string::npos) {
+                continue;
+            }
+
+            std::string key = line.substr(0, eq);
+            std::string value = line.substr(eq + 1);
+
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+
+            if (key == "NETWORK_TYPE") {
+                network_type = value;
+            } else if (key == "NETWORK_IFACE") {
+                iface = value;
+            }
+        }
+    }
+
+    if (network_type == "skip" || iface.empty()) {
+        return;
+    }
+
+    const char* path = network_type == "wifi" ? "/sbin/wifi-up" : "/sbin/netup";
+
+    if (access(path, X_OK) != 0) {
         return;
     }
 
@@ -880,11 +921,9 @@ void start_network_if_installed() {
             }
         }
 
-        const char* path = "/sbin/netup";
-
         char* const args[] = {
             (char*)path,
-            (char*)"eth0",
+            (char*)iface.c_str(),
             nullptr
         };
 

@@ -1,260 +1,572 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-DEW_ROOTFS_SOURCE="${DEW_ROOTFS_SOURCE:-build/rootfs-disk}"
+DEW_ROOTFS_SOURCE="${DEW_ROOTFS_SOURCE:-/rootfs-disk}"
 DEW_TARGET_MOUNT="${DEW_TARGET_MOUNT:-/mnt/dewos-target}"
+LOG_FILE="${LOG_FILE:-/var/log/dew-install.log}"
+DEW_ALLOW_LOOP="${DEW_ALLOW_LOOP:-0}"
+
+TARGET_DISK=""
+ROOT_PART=""
+ESP_PART=""
+BOOT_MODE="bios"
+HOSTNAME="dewos"
+USERNAME=""
+TIMEZONE="Europe/Paris"
+NETWORK_TYPE="skip"
+NETWORK_IFACE=""
+WIFI_SSID=""
+WIFI_PASS=""
+MOUNTED_ROOT=0
+MOUNTED_ESP=0
+
+ESC="$(printf '\033')"
+RESET="${ESC}[0m"
+BOLD="${ESC}[1m"
+DIM="${ESC}[2m"
+RED="${ESC}[31m"
+GREEN="${ESC}[32m"
+YELLOW="${ESC}[33m"
+BLUE="${ESC}[38;5;39m"
+CYAN="${ESC}[38;5;45m"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+: > "$LOG_FILE"
+
+cleanup() {
+  if [ "$MOUNTED_ESP" = "1" ] && mountpoint -q "$DEW_TARGET_MOUNT/boot/efi" 2>/dev/null; then
+    umount "$DEW_TARGET_MOUNT/boot/efi" >>"$LOG_FILE" 2>&1 || true
+  fi
+
+  if [ "$MOUNTED_ROOT" = "1" ] && mountpoint -q "$DEW_TARGET_MOUNT" 2>/dev/null; then
+    umount "$DEW_TARGET_MOUNT" >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+fail() {
+  printf '%s\n' "[ERROR] $*" >>"$LOG_FILE"
+  printf '\n%s%s%s\n' "$RED" "Installation failed: $*" "$RESET"
+  printf '%s\n' "Log: $LOG_FILE"
+  cleanup
+  exit 1
+}
+
+trap 'fail "Interrupted."' INT TERM
+trap cleanup EXIT
+
+log() {
+  printf '%s\n' "$*" >>"$LOG_FILE"
+}
+
+info() {
+  printf '%s%s%s\n' "$CYAN" "$*" "$RESET"
+  log "$*"
+}
+
+ok() {
+  printf '%s%s%s\n' "$GREEN" "$*" "$RESET"
+  log "$*"
+}
+
+warn() {
+  printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"
+  log "$*"
+}
+
+run() {
+  log "$ $*"
+  "$@" >>"$LOG_FILE" 2>&1 || fail "Command failed: $*"
+}
+
+try_run() {
+  log "$ $*"
+  "$@" >>"$LOG_FILE" 2>&1
+}
+
+pause() {
+  printf '\n%s' "Press Enter to continue..."
+  read dummy || true
+}
+
+line() {
+  printf '%s\n' "${BLUE}────────────────────────────────────────────────────────────────────────${RESET}"
+}
+
+header() {
+  clear 2>/dev/null || true
+  printf '%s\n' "${BOLD}${CYAN}"
+  printf '%s\n' "    ____                 ____   _____"
+  printf '%s\n' "   / __ \___ _      __  / __ \ / ___/"
+  printf '%s\n' "  / / / / _ \ | /| / / / / / / \__ \ "
+  printf '%s\n' " / /_/ /  __/ |/ |/ / / /_/ / ___/ / "
+  printf '%s\n' "/_____/\___/|__/|__/  \____/ /____/  "
+  printf '%s\n' "$RESET"
+  line
+  printf '%s\n' "${BOLD}$1${RESET}"
+  line
+}
+
+step() {
+  printf '\n%s%s%s\n' "$BOLD" "$1" "$RESET"
+  log "== $1 =="
+}
 
 need_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "[DewOS] Run as root."
-    exit 1
-  fi
+  [ "$(id -u)" = "0" ] || fail "Run installer as root."
 }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "[DewOS] Missing command: $1"
-    exit 1
-  }
+  command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"
 }
 
 check_tools() {
-  need_cmd lsblk
-  need_cmd fdisk
-  need_cmd mkfs.ext4
-  need_cmd mount
-  need_cmd umount
-  need_cmd blkid
-  need_cmd cp
-  need_cmd wipefs
-  need_cmd partprobe
-  need_cmd partx
-  need_cmd openssl
-  need_cmd sync
+  step "Checking installer tools"
+
+  for cmd in lsblk fdisk mkfs.ext4 mount umount blkid blockdev mknod cp rm mkdir chmod chown sync; do
+    need_cmd "$cmd"
+  done
+
+  for cmd in wipefs partprobe partx udevadm; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      warn "Optional tool missing: $cmd"
+    fi
+  done
+
+  if ! command -v grub-install >/dev/null 2>&1; then
+    fail "grub-install is missing. Rebuild initramfs after scripts/check-all.sh."
+  fi
+
+  ok "Tools ready."
+}
+
+detect_boot_mode() {
+  if [ -d /sys/firmware/efi ]; then
+    BOOT_MODE="uefi"
+  else
+    BOOT_MODE="bios"
+  fi
+}
+
+disk_size_bytes() {
+  local disk="$1"
+  blockdev --getsize64 "$disk" 2>/dev/null || echo 0
+}
+
+ensure_block_node() {
+  local dev="$1"
+  local name=""
+  local sys_dev=""
+  local major_minor=""
+  local major=""
+  local minor=""
+
+  [ -b "$dev" ] && return 0
+
+  name="$(basename "$dev")"
+  sys_dev="/sys/class/block/$name/dev"
+
+  [ -r "$sys_dev" ] || return 1
+
+  major_minor="$(cat "$sys_dev")"
+  major="${major_minor%:*}"
+  minor="${major_minor#*:}"
+
+  [ -n "$major" ] && [ -n "$minor" ] || return 1
+
+  mkdir -p /dev
+
+  if [ -e "$dev" ]; then
+    return 1
+  fi
+
+  mknod "$dev" b "$major" "$minor" || return 1
+  chmod 660 "$dev" 2>/dev/null || true
+}
+
+wait_for_block_node() {
+  local dev="$1"
+
+  for try in 1 2 3 4 5; do
+    if ensure_block_node "$dev"; then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  return 1
+}
+
+disk_has_mounts() {
+  local disk="$1"
+  lsblk -nr -o MOUNTPOINTS "$disk" 2>/dev/null | grep -q '/.'
 }
 
 show_disks() {
-  echo "[DewOS] Available disks:"
-  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+  header "Disk Selection"
+  printf '%s\n' "Choose the disk that DewOS will own completely."
+  printf '%s\n' "${RED}Everything on the selected disk will be erased.${RESET}"
+  if [ "$DEW_ALLOW_LOOP" = "1" ]; then
+    printf '%s\n' "${YELLOW}Loop devices are visible because DEW_ALLOW_LOOP=1.${RESET}"
+  fi
+  printf '\n'
+  printf '%s\n' "${BOLD}NUM  DISK        SIZE      TRAN     MODEL${RESET}"
+
+  n=1
+  lsblk -dn -o NAME,SIZE,TYPE,TRAN,RO,MODEL 2>/dev/null | while read name size type tran ro model; do
+    if [ "$type" != "disk" ]; then
+      [ "$DEW_ALLOW_LOOP" = "1" ] && [ "$type" = "loop" ] || continue
+    fi
+    [ "$ro" = "0" ] || continue
+
+    disk="/dev/$name"
+    mounted=""
+
+    if disk_has_mounts "$disk"; then
+      mounted=" ${YELLOW}(mounted, blocked)${RESET}"
+    fi
+
+    printf '%-4s %-11s %-9s %-8s %s%s\n' "$n" "$disk" "$size" "${tran:-?}" "${model:-unknown}" "$mounted"
+    n=$((n + 1))
+  done
+
+  printf '\n%s' "Target disk path, example /dev/sda: "
+  read TARGET_DISK
+  TARGET_DISK="$(printf '%s' "$TARGET_DISK" | tr -d ' ')"
+
+  ensure_block_node "$TARGET_DISK" || true
+  [ -b "$TARGET_DISK" ] || fail "Not a block device: $TARGET_DISK"
+
+  target_type="$(lsblk -dn -o TYPE "$TARGET_DISK" 2>/dev/null || true)"
+  if [ "$target_type" != "disk" ]; then
+    [ "$DEW_ALLOW_LOOP" = "1" ] && [ "$target_type" = "loop" ] || fail "Select a whole disk, not a partition: $TARGET_DISK"
+  fi
+
+  if disk_has_mounts "$TARGET_DISK"; then
+    fail "Disk has mounted filesystems. Unmount them first: $TARGET_DISK"
+  fi
+
+  bytes="$(disk_size_bytes "$TARGET_DISK")"
+  min_bytes=8589934592
+
+  if [ "$bytes" -lt "$min_bytes" ]; then
+    fail "Disk is too small. Need at least 8 GiB."
+  fi
 }
 
 confirm_danger() {
-  local disk="$1"
+  header "Confirm Destructive Install"
+  lsblk "$TARGET_DISK" || true
+  printf '\n%s\n' "${RED}${BOLD}This will erase $TARGET_DISK completely.${RESET}"
+  printf '%s\n' "To continue, type the exact disk path:"
+  read typed_disk
+  [ "$typed_disk" = "$TARGET_DISK" ] || fail "Confirmation disk did not match."
 
-  echo
-  echo "[DewOS] WARNING: this will ERASE: $disk"
-  echo "Type YES to continue:"
-  read -r answer
-
-  if [ "$answer" != "YES" ]; then
-    echo "[DewOS] Cancelled."
-    exit 1
-  fi
+  printf '%s\n' "Final confirmation: type ERASE"
+  read answer
+  [ "$answer" = "ERASE" ] || fail "Cancelled."
 }
 
 validate_username() {
-  local username="$1"
-
-  if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-    echo "[DewOS] Invalid username: $username"
-    echo "[DewOS] Use only lowercase letters, numbers, _, -"
-    exit 1
-  fi
-}
-
-validate_hostname() {
-  local hostname="$1"
-
-  if [[ ! "$hostname" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    echo "[DewOS] Invalid hostname: $hostname"
-    exit 1
-  fi
-}
-
-ask_password_hash() {
-  local label="$1"
-  local pass1
-  local pass2
-
-  echo "Password for $label:" >&2
-  read -rs pass1
-  echo >&2
-
-  echo "Repeat password for $label:" >&2
-  read -rs pass2
-  echo >&2
-
-  if [ "$pass1" != "$pass2" ]; then
-    echo "[DewOS] Passwords do not match." >&2
-    exit 1
-  fi
-
-  if [ -z "$pass1" ]; then
-    echo "[DewOS] Empty password is not allowed." >&2
-    exit 1
-  fi
-
-  openssl passwd -6 "$pass1"
-}
-ask_timezone() {
-  echo
-  echo "[DewOS] Timezone examples:"
-  echo "  Europe/Paris"
-  echo "  Europe/Moscow"
-  echo "  Asia/Yerevan"
-  echo "  UTC"
-  echo
-  echo "Timezone [Europe/Paris]:"
-  read -r timezone
-
-  if [ -z "$timezone" ]; then
-    timezone="Europe/Paris"
-  fi
-
-  echo "$timezone"
-}
-
-choose_network() {
-  echo
-  echo "[DewOS] Network setup:"
-  echo "  1) Ethernet"
-  echo "  2) Wi-Fi"
-  echo "  3) Skip"
-  echo
-  echo "Choose network type [1/2/3]:"
-  read -r net_choice
-
-  case "$net_choice" in
-    1)
-      NETWORK_TYPE="ethernet"
-      echo "Ethernet interface [eth0]:"
-      read -r eth_iface
-      if [ -z "$eth_iface" ]; then
-        eth_iface="eth0"
-      fi
-      NETWORK_IFACE="$eth_iface"
-      ;;
-    2)
-      NETWORK_TYPE="wifi"
-      echo
-      echo "[DewOS] Trying to show available Wi-Fi networks..."
-
-      if command -v nmcli >/dev/null 2>&1; then
-        nmcli -f SSID,SIGNAL,SECURITY dev wifi list || true
-      elif command -v iw >/dev/null 2>&1; then
-        echo "Wi-Fi interface on host, example wlan0:"
-        read -r host_wifi_iface
-        iw dev "$host_wifi_iface" scan | grep -E "SSID:|signal:" || true
-      else
-        echo "[DewOS] Host has no nmcli/iw. Cannot list Wi-Fi networks."
-      fi
-
-      echo
-      echo "Wi-Fi interface inside DewOS [wlan0]:"
-      read -r wifi_iface
-      if [ -z "$wifi_iface" ]; then
-        wifi_iface="wlan0"
-      fi
-
-      echo "Wi-Fi SSID:"
-      read -r wifi_ssid
-
-      if [ -z "$wifi_ssid" ]; then
-        echo "[DewOS] Empty SSID is not allowed."
-        exit 1
-      fi
-
-      echo "Wi-Fi password, empty for open network:"
-      read -rs wifi_pass
-      echo
-
-      NETWORK_TYPE="wifi"
-      NETWORK_IFACE="$wifi_iface"
-      WIFI_SSID="$wifi_ssid"
-      WIFI_PASS="$wifi_pass"
-      ;;
-    3|"")
-      NETWORK_TYPE="skip"
-      NETWORK_IFACE=""
-      ;;
-    *)
-      echo "[DewOS] Invalid network choice."
-      exit 1
+  case "$1" in
+    ""|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*|[0-9-]*)
+      fail "Invalid username. Use lowercase letters, numbers, _ and -; start with a letter or _.";
       ;;
   esac
 }
 
-partition_disk() {
-  local disk="$1"
+validate_hostname() {
+  case "$1" in
+    ""|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*)
+      fail "Invalid hostname.";
+      ;;
+  esac
+}
 
-  echo "[DewOS] Partitioning $disk..."
+ask_password_hash() {
+  label="$1"
+  printf '%s' "Password for $label: " >&2
+  stty -echo 2>/dev/null || true
+  read pass1
+  stty echo 2>/dev/null || true
+  printf '\n' >&2
 
-  wipefs -a "$disk" || true
+  printf '%s' "Repeat password for $label: " >&2
+  stty -echo 2>/dev/null || true
+  read pass2
+  stty echo 2>/dev/null || true
+  printf '\n' >&2
 
-  printf "g\nn\n\n\n\nw\n" | fdisk "$disk"
+  [ "$pass1" = "$pass2" ] || fail "Passwords do not match."
+  [ -n "$pass1" ] || fail "Empty password is not allowed."
 
-  sync
+  if command -v openssl >/dev/null 2>&1; then
+    openssl passwd -6 "$pass1"
+  else
+    fail "openssl is required for password hashing."
+  fi
+}
 
-  partprobe "$disk" || true
-  partx -u "$disk" || true
+ask_identity() {
+  header "User Setup"
+  printf '%s' "Username [artemy]: "
+  read USERNAME
+  [ -n "$USERNAME" ] || USERNAME="artemy"
+  validate_username "$USERNAME"
+
+  USER_HASH="$(ask_password_hash "$USERNAME")"
+  ROOT_HASH="$(ask_password_hash "root")"
+
+  printf '%s' "Hostname [dewos]: "
+  read HOSTNAME
+  [ -n "$HOSTNAME" ] || HOSTNAME="dewos"
+  validate_hostname "$HOSTNAME"
+
+  printf '%s' "Timezone [Europe/Paris]: "
+  read TIMEZONE
+  [ -n "$TIMEZONE" ] || TIMEZONE="Europe/Paris"
+}
+
+first_iface() {
+  for path in /sys/class/net/*; do
+    iface="$(basename "$path")"
+    [ "$iface" = "lo" ] && continue
+    printf '%s\n' "$iface"
+    return
+  done
+}
+
+wifi_iface_exists() {
+  iface="$1"
+  [ -d "/sys/class/net/$iface/wireless" ] || [ -d "/sys/class/net/$iface/phy80211" ]
+}
+
+choose_network() {
+  header "Network Setup"
+  printf '%s\n' "Network can be configured now and saved for first boot."
+  printf '\n'
+  printf '%s\n' "1) Ethernet DHCP"
+  printf '%s\n' "2) Wi-Fi WPA/WPA2"
+  printf '%s\n' "3) Skip"
+  printf '\n%s' "Choose [1/2/3]: "
+  read net_choice
+
+  case "$net_choice" in
+    1|"")
+      NETWORK_TYPE="ethernet"
+      default_iface="$(first_iface || true)"
+      [ -n "$default_iface" ] || default_iface="eth0"
+      printf '%s' "Ethernet interface [$default_iface]: "
+      read NETWORK_IFACE
+      [ -n "$NETWORK_IFACE" ] || NETWORK_IFACE="$default_iface"
+      ;;
+    2)
+      NETWORK_TYPE="wifi"
+      if command -v iw >/dev/null 2>&1; then
+        printf '%s\n' "Detected Wi-Fi devices:"
+        iw dev 2>/dev/null || true
+      fi
+
+      printf '%s' "Wi-Fi interface [wlan0]: "
+      read NETWORK_IFACE
+      [ -n "$NETWORK_IFACE" ] || NETWORK_IFACE="wlan0"
+
+      if ! wifi_iface_exists "$NETWORK_IFACE"; then
+        warn "Interface is not detected as Wi-Fi right now. It may need firmware/driver."
+      fi
+
+      if command -v iw >/dev/null 2>&1; then
+        try_run rfkill unblock all || true
+        try_run ip link set "$NETWORK_IFACE" up || true
+        printf '%s\n' "Scanning visible SSIDs..."
+        iw dev "$NETWORK_IFACE" scan 2>/dev/null | grep 'SSID:' | sed 's/^[ 	]*SSID: //' | sort -u | sed 's/^/  /' || true
+      fi
+
+      printf '%s' "SSID: "
+      read WIFI_SSID
+      [ -n "$WIFI_SSID" ] || fail "SSID cannot be empty."
+
+      printf '%s' "Password (empty for open network): "
+      stty -echo 2>/dev/null || true
+      read WIFI_PASS
+      stty echo 2>/dev/null || true
+      printf '\n'
+      ;;
+    3)
+      NETWORK_TYPE="skip"
+      NETWORK_IFACE=""
+      ;;
+    *)
+      fail "Invalid network choice."
+      ;;
+  esac
+}
+
+part_name() {
+  disk="$1"
+  num="$2"
+
+  case "$disk" in
+    *nvme*|*mmcblk*|*loop*) printf '%sp%s\n' "$disk" "$num" ;;
+    *) printf '%s%s\n' "$disk" "$num" ;;
+  esac
+}
+
+part_number() {
+  part="$1"
+
+  case "$part" in
+    "$TARGET_DISK"p*) printf '%s\n' "${part#"$TARGET_DISK"p}" ;;
+    "$TARGET_DISK"*) printf '%s\n' "${part#"$TARGET_DISK"}" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+read_mbr_disk_id() {
+  fdisk -l "$TARGET_DISK" 2>/dev/null |
+    awk '/Disk identifier:/ { print $3; exit }' |
+    sed 's/^0x//; s/[^0-9A-Fa-f].*$//'
+}
+
+root_partuuid_value() {
+  value="$(blkid -s PARTUUID -o value "$ROOT_PART" 2>/dev/null || true)"
+
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  if [ "$BOOT_MODE" != "bios" ]; then
+    return 1
+  fi
+
+  disk_id="$(read_mbr_disk_id)"
+  part_no="$(part_number "$ROOT_PART")"
+
+  case "$disk_id:$part_no" in
+    "":*|00000000:*|*:[!0123456789]*|*:)
+      return 1
+      ;;
+  esac
+
+  printf '%s-%02d\n' "$disk_id" "$part_no"
+}
+
+wait_for_partitions() {
+  if command -v partprobe >/dev/null 2>&1; then
+    try_run partprobe "$TARGET_DISK" || true
+  fi
+
+  if command -v partx >/dev/null 2>&1; then
+    try_run partx -u "$TARGET_DISK" || true
+  fi
 
   if command -v udevadm >/dev/null 2>&1; then
-    udevadm settle || true
+    try_run udevadm settle || true
   fi
 
   sleep 2
 }
 
-get_first_partition() {
-  local disk="$1"
+partition_disk() {
+  header "Partitioning"
+  detect_boot_mode
 
-  if [[ "$disk" =~ (nvme|mmcblk|loop) ]]; then
-    echo "${disk}p1"
+  step "Preparing $TARGET_DISK for $BOOT_MODE boot"
+  try_run swapoff -a || true
+  try_run wipefs -a "$TARGET_DISK" || true
+
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    need_cmd mkfs.vfat
+    printf 'g\nn\n1\n\n+512M\nt\n1\nn\n2\n\n\nw\n' | fdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || fail "fdisk failed"
+    ESP_PART="$(part_name "$TARGET_DISK" 1)"
+    ROOT_PART="$(part_name "$TARGET_DISK" 2)"
   else
-    echo "${disk}1"
+    disk_id="$(hexdump -n 4 -e '1/4 "%08x"' /dev/urandom 2>/dev/null || printf 'de000001')"
+    printf 'o\nx\ni\n0x%s\nr\nn\np\n1\n\n\na\n1\nw\n' "$disk_id" | fdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || fail "fdisk failed"
+    ROOT_PART="$(part_name "$TARGET_DISK" 1)"
   fi
+
+  sync
+  wait_for_partitions
+
+  wait_for_block_node "$ROOT_PART" || true
+  [ -b "$ROOT_PART" ] || fail "Root partition was not created: $ROOT_PART"
+
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    wait_for_block_node "$ESP_PART" || true
+    [ -b "$ESP_PART" ] || fail "EFI partition was not created: $ESP_PART"
+  fi
+
+  ok "Partitions ready."
 }
 
-format_partition() {
-  local part="$1"
-
-  echo "[DewOS] Formatting $part as ext4..."
-  mkfs.ext4 -F "$part"
-}
-
-mount_target() {
-  local part="$1"
-
-  echo "[DewOS] Mounting $part to $DEW_TARGET_MOUNT..."
-
+format_and_mount() {
+  header "Formatting"
+  run mkfs.ext4 -F -L DewOS "$ROOT_PART"
   mkdir -p "$DEW_TARGET_MOUNT"
+  run mount "$ROOT_PART" "$DEW_TARGET_MOUNT"
+  MOUNTED_ROOT=1
 
-  if mountpoint -q "$DEW_TARGET_MOUNT"; then
-    echo "[DewOS] $DEW_TARGET_MOUNT is already mounted. Unmounting..."
-    umount "$DEW_TARGET_MOUNT"
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    run mkfs.vfat -F32 -n DEWESP "$ESP_PART"
+    mkdir -p "$DEW_TARGET_MOUNT/boot/efi"
+    run mount "$ESP_PART" "$DEW_TARGET_MOUNT/boot/efi"
+    MOUNTED_ESP=1
   fi
-
-  mount "$part" "$DEW_TARGET_MOUNT"
 }
 
 copy_rootfs() {
-  echo "[DewOS] Copying rootfs from $DEW_ROOTFS_SOURCE..."
+  header "Copying System"
 
-  if [ ! -d "$DEW_ROOTFS_SOURCE" ]; then
-    echo "[DewOS] RootFS source not found: $DEW_ROOTFS_SOURCE"
-    exit 1
+  if [ -d "$DEW_ROOTFS_SOURCE" ]; then
+    step "Copying rootfs template"
+    run cp -a "$DEW_ROOTFS_SOURCE/." "$DEW_TARGET_MOUNT/"
+  else
+    warn "Rootfs template not found: $DEW_ROOTFS_SOURCE"
+    warn "Creating install from live runtime files."
   fi
 
-  cp -a "$DEW_ROOTFS_SOURCE"/. "$DEW_TARGET_MOUNT"/
+  step "Installing runtime tools"
+  mkdir -p "$DEW_TARGET_MOUNT/bin" "$DEW_TARGET_MOUNT/sbin" "$DEW_TARGET_MOUNT/etc"
+  mkdir -p "$DEW_TARGET_MOUNT/proc" "$DEW_TARGET_MOUNT/sys" "$DEW_TARGET_MOUNT/dev"
+  mkdir -p "$DEW_TARGET_MOUNT/tmp" "$DEW_TARGET_MOUNT/root" "$DEW_TARGET_MOUNT/home"
+  mkdir -p "$DEW_TARGET_MOUNT/var/log" "$DEW_TARGET_MOUNT/run" "$DEW_TARGET_MOUNT/boot"
+  mkdir -p "$DEW_TARGET_MOUNT/usr/bin" "$DEW_TARGET_MOUNT/usr/sbin" "$DEW_TARGET_MOUNT/lib" "$DEW_TARGET_MOUNT/lib64"
+  chmod 1777 "$DEW_TARGET_MOUNT/tmp"
+
+  for dir in bin sbin usr/bin usr/sbin lib lib64; do
+    if [ -d "/$dir" ]; then
+      run cp -a "/$dir/." "$DEW_TARGET_MOUNT/$dir/"
+    fi
+  done
+
+  if [ -x /init ]; then
+    run cp /init "$DEW_TARGET_MOUNT/sbin/init"
+    chmod +x "$DEW_TARGET_MOUNT/sbin/init"
+  fi
+
+  if [ -f /boot/vmlinuz-dewos ]; then
+    run cp /boot/vmlinuz-dewos "$DEW_TARGET_MOUNT/boot/vmlinuz-dewos"
+  elif [ -f /run/initramfs/live/boot/vmlinuz-dewos ]; then
+    run cp /run/initramfs/live/boot/vmlinuz-dewos "$DEW_TARGET_MOUNT/boot/vmlinuz-dewos"
+  elif [ -f out/bzImage ]; then
+    run cp out/bzImage "$DEW_TARGET_MOUNT/boot/vmlinuz-dewos"
+  else
+    fail "Kernel image not found for installed system."
+  fi
+
+  [ -f "$DEW_TARGET_MOUNT/boot/vmlinuz-dewos" ] || fail "Kernel copy failed: /boot/vmlinuz-dewos"
+  ln -sf boot/vmlinuz-dewos "$DEW_TARGET_MOUNT/vmlinuz-dewos"
+
+  touch "$DEW_TARGET_MOUNT/etc/dewos-installed"
+  ok "System files copied."
 }
 
-write_fstab() {
-  local part="$1"
-  local uuid
-
-  uuid="$(blkid -s UUID -o value "$part")"
-
-  mkdir -p "$DEW_TARGET_MOUNT/etc"
+write_basic_config() {
+  header "Writing Configuration"
+  uuid="$(blkid -s UUID -o value "$ROOT_PART")"
+  [ -n "$uuid" ] || fail "Cannot read root UUID."
 
   cat > "$DEW_TARGET_MOUNT/etc/fstab" <<EOF_INNER
 UUID=$uuid / ext4 defaults 0 1
@@ -263,364 +575,371 @@ sysfs /sys sysfs defaults 0 0
 devtmpfs /dev devtmpfs defaults 0 0
 tmpfs /tmp tmpfs defaults,mode=1777 0 0
 EOF_INNER
-}
 
-write_hostname() {
-  local hostname="$1"
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    esp_uuid="$(blkid -s UUID -o value "$ESP_PART")"
+    cat >> "$DEW_TARGET_MOUNT/etc/fstab" <<EOF_INNER
+UUID=$esp_uuid /boot/efi vfat umask=0077 0 2
+EOF_INNER
+  fi
 
-  echo "$hostname" > "$DEW_TARGET_MOUNT/etc/hostname"
-
+  printf '%s\n' "$HOSTNAME" > "$DEW_TARGET_MOUNT/etc/hostname"
   cat > "$DEW_TARGET_MOUNT/etc/hosts" <<EOF_INNER
 127.0.0.1 localhost
-127.0.1.1 $hostname
+127.0.1.1 $HOSTNAME
 ::1 localhost ip6-localhost ip6-loopback
 EOF_INNER
-}
 
-write_resolv_conf() {
   cat > "$DEW_TARGET_MOUNT/etc/resolv.conf" <<EOF_INNER
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 EOF_INNER
+
+  printf '%s\n' "$TIMEZONE" > "$DEW_TARGET_MOUNT/etc/timezone"
 }
 
-write_time_config() {
-  local timezone="$1"
-
-  echo "$timezone" > "$DEW_TARGET_MOUNT/etc/timezone"
-
-  if [ -f "$DEW_TARGET_MOUNT/usr/share/zoneinfo/$timezone" ]; then
-    ln -sf "/usr/share/zoneinfo/$timezone" "$DEW_TARGET_MOUNT/etc/localtime"
-  else
-    echo "[DewOS] Zoneinfo not found in rootfs."
-    echo "[DewOS] Wrote /etc/timezone only."
-  fi
-}
-
-create_user_files() {
-  local username="$1"
-  local user_hash="$2"
-  local root_hash="$3"
-
-  echo "[DewOS] Creating root and user accounts..."
-
-  mkdir -p "$DEW_TARGET_MOUNT/etc"
-  mkdir -p "$DEW_TARGET_MOUNT/root"
-  mkdir -p "$DEW_TARGET_MOUNT/home/$username"
+create_users() {
+  step "Creating users"
+  mkdir -p "$DEW_TARGET_MOUNT/root" "$DEW_TARGET_MOUNT/home/$USERNAME"
 
   cat > "$DEW_TARGET_MOUNT/etc/passwd" <<EOF_INNER
 root:x:0:0:root:/root:/bin/sh
-$username:x:1000:1000:$username:/home/$username:/bin/sh
+$USERNAME:x:1000:1000:$USERNAME:/home/$USERNAME:/bin/sh
 EOF_INNER
 
   cat > "$DEW_TARGET_MOUNT/etc/group" <<EOF_INNER
 root:x:0:
 users:x:100:
-$username:x:1000:
-wheel:x:10:$username
+wheel:x:10:$USERNAME
+$USERNAME:x:1000:
 EOF_INNER
 
   cat > "$DEW_TARGET_MOUNT/etc/shadow" <<EOF_INNER
-root:$root_hash:19000:0:99999:7:::
-$username:$user_hash:19000:0:99999:7:::
+root:$ROOT_HASH:19000:0:99999:7:::
+$USERNAME:$USER_HASH:19000:0:99999:7:::
 EOF_INNER
 
-  chmod 644 "$DEW_TARGET_MOUNT/etc/passwd"
-  chmod 644 "$DEW_TARGET_MOUNT/etc/group"
+  chmod 644 "$DEW_TARGET_MOUNT/etc/passwd" "$DEW_TARGET_MOUNT/etc/group"
   chmod 600 "$DEW_TARGET_MOUNT/etc/shadow"
-
   chmod 700 "$DEW_TARGET_MOUNT/root"
-  chmod 755 "$DEW_TARGET_MOUNT/home/$username"
-
+  chmod 755 "$DEW_TARGET_MOUNT/home/$USERNAME"
   chown 0:0 "$DEW_TARGET_MOUNT/root" || true
-  chown 1000:1000 "$DEW_TARGET_MOUNT/home/$username" || true
+  chown 1000:1000 "$DEW_TARGET_MOUNT/home/$USERNAME" || true
 }
 
 write_network_scripts() {
-  mkdir -p "$DEW_TARGET_MOUNT/sbin"
-  mkdir -p "$DEW_TARGET_MOUNT/etc/network"
-  mkdir -p "$DEW_TARGET_MOUNT/etc/wpa_supplicant"
-  mkdir -p "$DEW_TARGET_MOUNT/var/run/wpa_supplicant"
+  step "Writing stable network autostart"
+  mkdir -p "$DEW_TARGET_MOUNT/sbin" "$DEW_TARGET_MOUNT/etc/dewos" "$DEW_TARGET_MOUNT/etc/udhcpc" "$DEW_TARGET_MOUNT/etc/wpa_supplicant" "$DEW_TARGET_MOUNT/var/run/wpa_supplicant"
 
   cat > "$DEW_TARGET_MOUNT/sbin/netup" <<'EOF_INNER'
 #!/bin/sh
-set -e
+set -u
 
 IFACE="${1:-eth0}"
+LOG="/var/log/dew-network.log"
+LOCK="/run/dew-network.lock"
+SCRIPT="/etc/udhcpc/default.script"
 
-echo "[DewOS] Bringing up interface: $IFACE"
+mkdir -p /run /var/log
 
-if command -v ip >/dev/null 2>&1; then
-  ip link set "$IFACE" up || true
-elif command -v ifconfig >/dev/null 2>&1; then
-  ifconfig "$IFACE" up || true
+if mkdir "$LOCK" 2>/dev/null; then
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 else
-  echo "[DewOS] Missing ip/ifconfig."
-  exit 1
+  echo "[DewOS] network already starting" >> "$LOG"
+  exit 0
 fi
+
+echo "[DewOS] netup $IFACE $(date 2>/dev/null)" >> "$LOG"
+
+ip link set "$IFACE" up >> "$LOG" 2>&1 || ifconfig "$IFACE" up >> "$LOG" 2>&1 || exit 1
 
 if command -v udhcpc >/dev/null 2>&1; then
-  udhcpc -i "$IFACE"
-elif command -v dhclient >/dev/null 2>&1; then
-  dhclient "$IFACE"
+  for try in 1 2 3; do
+    if [ -x "$SCRIPT" ]; then
+      udhcpc -i "$IFACE" -s "$SCRIPT" -q -n >> "$LOG" 2>&1 && break
+    else
+      udhcpc -i "$IFACE" -q -n >> "$LOG" 2>&1 && break
+    fi
+    sleep 2
+  done
 else
-  echo "[DewOS] Missing DHCP client: udhcpc or dhclient."
+  echo "[DewOS] missing udhcpc" >> "$LOG"
   exit 1
 fi
 
-echo "[DewOS] Ethernet network should be up."
+ip addr show "$IFACE" >> "$LOG" 2>&1 || true
+ip route >> "$LOG" 2>&1 || true
 EOF_INNER
-
-  chmod +x "$DEW_TARGET_MOUNT/sbin/netup"
 
   cat > "$DEW_TARGET_MOUNT/sbin/wifi-up" <<'EOF_INNER'
 #!/bin/sh
-set -e
+set -u
 
 IFACE="${1:-wlan0}"
 CONF="/etc/wpa_supplicant/wpa_supplicant.conf"
+LOG="/var/log/dew-network.log"
 
-if [ ! -f "$CONF" ]; then
-  echo "[DewOS] Missing Wi-Fi config: $CONF"
+mkdir -p /run /var/log /var/run/wpa_supplicant
+
+[ -f "$CONF" ] || {
+  echo "[DewOS] missing $CONF" >> "$LOG"
   exit 1
-fi
+}
 
-if ! command -v wpa_supplicant >/dev/null 2>&1; then
-  echo "[DewOS] Missing wpa_supplicant."
-  exit 1
-fi
+rfkill unblock all >> "$LOG" 2>&1 || true
+ip link set "$IFACE" up >> "$LOG" 2>&1 || ifconfig "$IFACE" up >> "$LOG" 2>&1 || true
 
-echo "[DewOS] Bringing Wi-Fi up: $IFACE"
-
-if command -v ip >/dev/null 2>&1; then
-  ip link set "$IFACE" up || true
-elif command -v ifconfig >/dev/null 2>&1; then
-  ifconfig "$IFACE" up || true
-else
-  echo "[DewOS] Missing ip/ifconfig."
-  exit 1
-fi
-
-wpa_supplicant -B -i "$IFACE" -c "$CONF"
-
-if command -v udhcpc >/dev/null 2>&1; then
-  udhcpc -i "$IFACE"
-elif command -v dhclient >/dev/null 2>&1; then
-  dhclient "$IFACE"
-else
-  echo "[DewOS] Missing DHCP client: udhcpc or dhclient."
-  exit 1
-fi
-
-echo "[DewOS] Wi-Fi should be up."
+killall wpa_supplicant >> "$LOG" 2>&1 || true
+wpa_supplicant -B -i "$IFACE" -c "$CONF" -f /var/log/wpa_supplicant.log >> "$LOG" 2>&1 || exit 1
+sleep 5
+/sbin/netup "$IFACE"
 EOF_INNER
 
-  chmod +x "$DEW_TARGET_MOUNT/sbin/wifi-up"
-
-  cat > "$DEW_TARGET_MOUNT/sbin/time-sync" <<'EOF_INNER'
+  cat > "$DEW_TARGET_MOUNT/sbin/dew-network-autostart" <<'EOF_INNER'
 #!/bin/sh
-set -e
 
-echo "[DewOS] Syncing time..."
+CONF="/etc/dewos/network.conf"
+LOG="/var/log/dew-network.log"
 
-if command -v ntpd >/dev/null 2>&1; then
-  ntpd -q -p pool.ntp.org
-elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -q '^ntpd$'; then
-  busybox ntpd -q -p pool.ntp.org
-elif command -v chronyd >/dev/null 2>&1; then
-  chronyd -q 'server pool.ntp.org iburst'
-else
-  echo "[DewOS] Missing NTP client: ntpd, busybox ntpd, or chronyd."
-  exit 1
-fi
+mkdir -p /var/log
+[ -f "$CONF" ] || exit 0
 
-echo "[DewOS] Time synced."
+. "$CONF"
+
+case "${NETWORK_TYPE:-skip}" in
+  ethernet)
+    /sbin/netup "${NETWORK_IFACE:-eth0}" >> "$LOG" 2>&1 &
+    ;;
+  wifi)
+    /sbin/wifi-up "${NETWORK_IFACE:-wlan0}" >> "$LOG" 2>&1 &
+    ;;
+esac
 EOF_INNER
 
-  chmod +x "$DEW_TARGET_MOUNT/sbin/time-sync"
+  cat > "$DEW_TARGET_MOUNT/etc/udhcpc/default.script" <<'EOF_INNER'
+#!/bin/sh
+
+RESOLV_CONF="/etc/resolv.conf"
+
+case "$1" in
+  deconfig)
+    ip addr flush dev "$interface" 2>/dev/null || true
+    ;;
+  renew|bound)
+    ip addr flush dev "$interface" 2>/dev/null || true
+    ip addr add "$ip/${mask:-24}" dev "$interface" 2>/dev/null || true
+    ip link set "$interface" up 2>/dev/null || true
+
+    if [ -n "$router" ]; then
+      ip route del default 2>/dev/null || true
+      for gw in $router; do
+        ip route add default via "$gw" dev "$interface" 2>/dev/null || true
+        break
+      done
+    fi
+
+    : > "$RESOLV_CONF"
+    if [ -n "$dns" ]; then
+      for ns in $dns; do
+        echo "nameserver $ns" >> "$RESOLV_CONF"
+      done
+    else
+      echo "nameserver 1.1.1.1" >> "$RESOLV_CONF"
+      echo "nameserver 8.8.8.8" >> "$RESOLV_CONF"
+    fi
+    ;;
+esac
+EOF_INNER
+
+  chmod +x "$DEW_TARGET_MOUNT/sbin/netup" "$DEW_TARGET_MOUNT/sbin/wifi-up" "$DEW_TARGET_MOUNT/sbin/dew-network-autostart" "$DEW_TARGET_MOUNT/etc/udhcpc/default.script"
+
+  cat > "$DEW_TARGET_MOUNT/etc/dewos/network.conf" <<EOF_INNER
+NETWORK_TYPE="$NETWORK_TYPE"
+NETWORK_IFACE="$NETWORK_IFACE"
+EOF_INNER
+
+  if [ "$NETWORK_TYPE" = "wifi" ]; then
+    write_wifi_config
+  fi
 }
 
 write_wifi_config() {
-  local ssid="$1"
-  local pass="$2"
-
-  if [ -z "$ssid" ]; then
+  if [ -z "$WIFI_SSID" ]; then
     return
   fi
 
-  mkdir -p "$DEW_TARGET_MOUNT/etc/wpa_supplicant"
-
-  if [ -z "$pass" ]; then
+  if [ -z "$WIFI_PASS" ]; then
     cat > "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf" <<EOF_INNER
 ctrl_interface=/var/run/wpa_supplicant
 update_config=1
 
 network={
-    ssid="$ssid"
+    ssid="$WIFI_SSID"
     key_mgmt=NONE
 }
 EOF_INNER
+  elif command -v wpa_passphrase >/dev/null 2>&1; then
+    wpa_passphrase "$WIFI_SSID" "$WIFI_PASS" > "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf"
   else
-    if command -v wpa_passphrase >/dev/null 2>&1; then
-      wpa_passphrase "$ssid" "$pass" > "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf"
-    else
-      cat > "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf" <<EOF_INNER
+    cat > "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf" <<EOF_INNER
 ctrl_interface=/var/run/wpa_supplicant
 update_config=1
 
 network={
-    ssid="$ssid"
-    psk="$pass"
+    ssid="$WIFI_SSID"
+    psk="$WIFI_PASS"
 }
 EOF_INNER
-    fi
   fi
 
   chmod 600 "$DEW_TARGET_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf"
 }
 
-write_first_boot_config() {
-  local network_type="$1"
-  local iface="$2"
-
-  mkdir -p "$DEW_TARGET_MOUNT/etc/dewos"
-
-  cat > "$DEW_TARGET_MOUNT/etc/dewos/network.conf" <<EOF_INNER
-NETWORK_TYPE="$network_type"
-NETWORK_IFACE="$iface"
-EOF_INNER
-
+write_issue() {
   cat > "$DEW_TARGET_MOUNT/etc/issue" <<EOF_INNER
-DewOS experimental install
+DewOS
 
-Useful commands:
-
-Ethernet:
+Network:
   /sbin/netup eth0
-
-Wi-Fi:
   /sbin/wifi-up wlan0
+  cat /var/log/dew-network.log
 
-Time sync:
-  /sbin/time-sync
+Installer log:
+  /var/log/dew-install.log
 EOF_INNER
 }
 
-verify_rootfs_tools() {
-  echo "[DewOS] Checking installed rootfs tools..."
+write_grub_cfg() {
+  root_uuid="$(blkid -s UUID -o value "$ROOT_PART" 2>/dev/null || true)"
+  root_partuuid="$(root_partuuid_value || true)"
 
-  if [ ! -x "$DEW_TARGET_MOUNT/bin/busybox" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/udhcpc" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/dhclient" ]; then
-    echo "[DewOS] WARNING: DHCP tool not found in rootfs."
-    echo "[DewOS] Need udhcpc/dhclient/busybox for internet."
-  fi
+  [ -n "$root_uuid" ] || fail "Cannot read root filesystem UUID."
+  [ -n "$root_partuuid" ] || fail "Cannot read or build root PARTUUID."
 
-  if [ ! -x "$DEW_TARGET_MOUNT/bin/ip" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/ip" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/bin/ifconfig" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/ifconfig" ]; then
-    echo "[DewOS] WARNING: ip/ifconfig not found in rootfs."
-  fi
+  mkdir -p "$DEW_TARGET_MOUNT/boot/grub"
 
-  if [ "$NETWORK_TYPE" = "wifi" ]; then
-    if [ ! -x "$DEW_TARGET_MOUNT/sbin/wpa_supplicant" ] && \
-       [ ! -x "$DEW_TARGET_MOUNT/bin/wpa_supplicant" ]; then
-      echo "[DewOS] WARNING: wpa_supplicant not found in rootfs."
-      echo "[DewOS] Wi-Fi will not work until you add wpa_supplicant + drivers + firmware."
+  cat > "$DEW_TARGET_MOUNT/boot/grub/grub.cfg" <<EOF_INNER
+set default=0
+set timeout=4
+set timeout_style=menu
+set gfxmode=1024x768x32
+
+insmod all_video
+insmod gfxterm
+insmod ext2
+terminal_output gfxterm
+
+set color_normal=cyan/black
+set color_highlight=black/cyan
+set menu_color_normal=cyan/black
+set menu_color_highlight=black/cyan
+
+menuentry "DewOS" {
+    search --no-floppy --fs-uuid --set=root $root_uuid
+    set gfxpayload=1024x768x16,1024x768
+    linux /boot/vmlinuz-dewos root=PARTUUID=$root_partuuid rootfstype=ext4 rootwait rw init=/sbin/init quiet loglevel=0 vt.global_cursor_default=0 nokaslr
+}
+
+menuentry "DewOS (debug)" {
+    search --no-floppy --fs-uuid --set=root $root_uuid
+    set gfxpayload=text
+    linux /boot/vmlinuz-dewos root=PARTUUID=$root_partuuid rootfstype=ext4 rootwait rw init=/sbin/init console=tty1 console=ttyS0,115200 loglevel=7 vt.global_cursor_default=1 nomodeset nokaslr
+}
+EOF_INNER
+}
+
+install_bootloader() {
+  header "Installing Bootloader"
+  write_grub_cfg
+
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    if try_run grub-install --target=x86_64-efi --efi-directory="$DEW_TARGET_MOUNT/boot/efi" --boot-directory="$DEW_TARGET_MOUNT/boot" --bootloader-id=DewOS "$TARGET_DISK"; then
+      ok "UEFI GRUB installed."
+    else
+      warn "NVRAM install failed, trying removable UEFI install."
+      run grub-install --target=x86_64-efi --efi-directory="$DEW_TARGET_MOUNT/boot/efi" --boot-directory="$DEW_TARGET_MOUNT/boot" --bootloader-id=DewOS --removable "$TARGET_DISK"
     fi
+  else
+    run grub-install --target=i386-pc --boot-directory="$DEW_TARGET_MOUNT/boot" "$TARGET_DISK"
+  fi
+}
+
+post_install_check() {
+  header "Post-install Check"
+  errors=0
+
+  check_path() {
+    if [ -e "$DEW_TARGET_MOUNT/$1" ]; then
+      ok "ok: /$1"
+    else
+      warn "missing: /$1"
+      errors=$((errors + 1))
+    fi
+  }
+
+  check_path etc/dewos-installed
+  check_path sbin/init
+  check_path vmlinuz-dewos
+  check_path boot/vmlinuz-dewos
+  check_path boot/grub/grub.cfg
+  check_path etc/fstab
+  check_path etc/passwd
+  check_path etc/shadow
+  check_path sbin/dew-network-autostart
+  check_path var/log/dew-install.log
+
+  if [ "$errors" -ne 0 ]; then
+    fail "Post-install check found $errors problem(s)."
   fi
 
-  if [ ! -x "$DEW_TARGET_MOUNT/bin/busybox" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/bin/ntpd" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/ntpd" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/bin/chronyd" ] && \
-     [ ! -x "$DEW_TARGET_MOUNT/sbin/chronyd" ]; then
-    echo "[DewOS] WARNING: NTP client not found."
-    echo "[DewOS] Time sync needs busybox ntpd, ntpd, or chronyd."
-  fi
+  ok "Post-install check passed."
+}
+
+copy_install_log() {
+  mkdir -p "$DEW_TARGET_MOUNT/var/log"
+  cp "$LOG_FILE" "$DEW_TARGET_MOUNT/var/log/dew-install.log" 2>/dev/null || true
+}
+
+summary() {
+  header "Installed"
+  printf '%s\n' "${GREEN}${BOLD}DewOS installed successfully.${RESET}"
+  printf '\n'
+  printf '%-18s %s\n' "Disk:" "$TARGET_DISK"
+  printf '%-18s %s\n' "Root:" "$ROOT_PART"
+  [ -n "$ESP_PART" ] && printf '%-18s %s\n' "EFI:" "$ESP_PART"
+  printf '%-18s %s\n' "Boot mode:" "$BOOT_MODE"
+  printf '%-18s %s\n' "Hostname:" "$HOSTNAME"
+  printf '%-18s %s\n' "User:" "$USERNAME"
+  printf '%-18s %s\n' "Network:" "$NETWORK_TYPE ${NETWORK_IFACE:-}"
+  printf '%-18s %s\n' "Log:" "$DEW_TARGET_MOUNT/var/log/dew-install.log"
+  printf '\n%s\n' "You can reboot and choose DewOS from GRUB."
 }
 
 main() {
   need_root
+  header "DewOS Installer"
+  printf '%s\n' "This installer will prepare a real bootable DewOS disk."
+  printf '%s\n' "It supports BIOS and UEFI, writes GRUB, and saves logs."
+  pause
+
   check_tools
   show_disks
-
-  echo
-  echo "Target disk, example /dev/sda, /dev/vda, /dev/loop44:"
-  read -r disk
-
-  if [ ! -b "$disk" ]; then
-    echo "[DewOS] Not a block device: $disk"
-    exit 1
-  fi
-
-  confirm_danger "$disk"
-
-  echo "Username:"
-  read -r username
-  validate_username "$username"
-
-  user_hash="$(ask_password_hash "$username")"
-  root_hash="$(ask_password_hash "root")"
-
-  echo "Hostname [dewos]:"
-  read -r hostname
-  if [ -z "$hostname" ]; then
-    hostname="dewos"
-  fi
-  validate_hostname "$hostname"
-
-  timezone="$(ask_timezone)"
-
-  NETWORK_TYPE="skip"
-  NETWORK_IFACE=""
-  WIFI_SSID=""
-  WIFI_PASS=""
+  confirm_danger
+  ask_identity
   choose_network
-
-  partition_disk "$disk"
-
-  part="$(get_first_partition "$disk")"
-
-  if [ ! -b "$part" ]; then
-    echo "[DewOS] Partition not found: $part"
-    echo "[DewOS] Current block devices:"
-    lsblk "$disk"
-    exit 1
-  fi
-
-  format_partition "$part"
-  mount_target "$part"
+  partition_disk
+  format_and_mount
   copy_rootfs
-
-  write_fstab "$part"
-  write_hostname "$hostname"
-  write_resolv_conf
-  write_time_config "$timezone"
-  create_user_files "$username" "$user_hash" "$root_hash"
+  write_basic_config
+  create_users
   write_network_scripts
-
-  if [ "$NETWORK_TYPE" = "wifi" ]; then
-    write_wifi_config "$WIFI_SSID" "$WIFI_PASS"
-  fi
-
-  write_first_boot_config "$NETWORK_TYPE" "$NETWORK_IFACE"
-  verify_rootfs_tools
-
+  write_issue
+  install_bootloader
+  copy_install_log
+  post_install_check
+  copy_install_log
   sync
-
-  echo
-  echo "[DewOS] Installed to $part"
-  echo "[DewOS] Mounted at $DEW_TARGET_MOUNT"
-  echo
-  echo "[DewOS] Check:"
-  echo "  cat $DEW_TARGET_MOUNT/etc/passwd"
-  echo "  cat $DEW_TARGET_MOUNT/etc/shadow"
-  echo "  cat $DEW_TARGET_MOUNT/etc/timezone"
-  echo
-  echo "[DewOS] When done:"
-  echo "  sudo umount $DEW_TARGET_MOUNT"
+  summary
 }
 
 main "$@"

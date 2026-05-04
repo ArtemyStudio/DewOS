@@ -18,12 +18,12 @@ KERNEL_CONFIGS=(
 PACKAGES=(
   build-essential bc bison flex libelf-dev libssl-dev
   xz-utils wget cpio gzip grub-pc-bin grub-common xorriso mtools
-  qemu-system-x86 busybox-static e2fsprogs util-linux fdisk imagemagick
+  qemu-system-x86 busybox-static e2fsprogs dosfstools util-linux fdisk imagemagick
 )
 
 COMMANDS=(
   g++ gcc make wget tar xz cpio gzip
-  grub-mkrescue qemu-system-x86_64 busybox mkfs.ext4 convert
+  grub-mkrescue grub-install qemu-system-x86_64 busybox mkfs.ext4 mkfs.vfat convert
 )
 
 missing_command() {
@@ -117,13 +117,18 @@ if [ -n "$MISSING_COMMANDS" ] || [ -n "$MISSING_PACKAGES" ]; then
   install_packages
 fi
 
-if [ ! -d "$KDIR" ]; then
+if [ ! -d "$KDIR" ] && [ ! -f "$KERNEL_OUT" ]; then
   echo "[DewOS] Kernel source is missing."
   ./scripts/fetch-src.sh kernel
 fi
 
-if [ ! -f "$KERNEL_OUT" ] || ! kernel_config_ready; then
+if [ "${DEW_REBUILD_KERNEL:-0}" = "1" ]; then
   build_kernel
+elif [ ! -f "$KERNEL_OUT" ]; then
+  build_kernel
+elif ! kernel_config_ready; then
+  echo "[DewOS] Using existing kernel: $KERNEL_OUT"
+  echo "[DewOS] Run DEW_REBUILD_KERNEL=1 ./scripts/check-all.sh to rebuild it."
 fi
 
 echo "[DewOS] Host tools and kernel are ready."

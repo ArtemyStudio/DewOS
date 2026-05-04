@@ -1,0 +1,12 @@
+build/
+out/
+sources/
+third_party/
+
+*.img
+*.iso
+*.cpio.gz
+*.ext4
+
+.cache/
+.tmp/

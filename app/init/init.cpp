@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 
 bool rootfs_ready = false;
 
@@ -34,6 +35,16 @@ int main() {
 
     show_boot_splash();
 
+    bool installer_mode = false;
+    {
+        std::ifstream cmdline("/proc/cmdline");
+        std::string line;
+
+        if (std::getline(cmdline, line)) {
+            installer_mode = line.find("dew.mode=installer") != std::string::npos;
+        }
+    }
+
     if (rootfs_ready) {
         cmd_clear(CommandContext{});
         print_banner();
@@ -41,6 +52,29 @@ int main() {
         start_network_if_installed();
 
         login_loop();
+    } else if (installer_mode) {
+        cmd_clear(CommandContext{});
+        print_banner();
+        raw_write("\033[?25h");
+
+        pid_t pid = fork();
+
+        if (pid == 0) {
+            const char* path = "/sbin/dew-install";
+            char* const args[] = {
+                (char*)path,
+                nullptr
+            };
+
+            execv(path, args);
+            perror("execv /sbin/dew-install failed");
+            _exit(127);
+        }
+
+        if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+        }
     } else {
         current_user = "root";
         current_uid = 0;
@@ -424,6 +458,7 @@ void setup_console() {
 void mount_basic_fs() {
     mkdir("/proc", 0555);
     mkdir("/sys", 0555);
+    mkdir("/dev", 0755);
     mkdir("/tmp", 01777);
 
     if (mount("proc", "/proc", "proc", 0, nullptr) < 0 && errno != EBUSY) {
@@ -432,6 +467,10 @@ void mount_basic_fs() {
 
     if (mount("sysfs", "/sys", "sysfs", 0, nullptr) < 0 && errno != EBUSY) {
         print_error("mount: failed to mount /sys");
+    }
+
+    if (mount("devtmpfs", "/dev", "devtmpfs", 0, nullptr) < 0 && errno != EBUSY) {
+        print_error("mount: failed to mount /dev");
     }
 }
 
