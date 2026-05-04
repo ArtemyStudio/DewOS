@@ -1,35 +1,38 @@
-#include "init.hpp"
+#include "../include/init.hpp"
+#include "../include/system.hpp"
+#include "../include/shell.hpp"
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <cstring>
-#include <cstdint>
-#include <iomanip>
-#include <vector>
 #include <cerrno>
-#include <cstdio>
-#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
 
 #include <unistd.h>
-#include <dirent.h>
 #include <fcntl.h>
-#include <crypt.h>
-#include <sys/wait.h>
-#include <sys/reboot.h>
-#include <linux/reboot.h>
-#include <sys/select.h>
-#include <sys/time.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
-#include <sys/utsname.h>
 #include <sys/sysmacros.h>
+
+bool rootfs_ready = false;
+
 
 int main() {
     setup_console();
+    raw_write("\033[?25l");
+    raw_write("\033[2J\033[H");
+    raw_write("[DewOS] console ready\n");
+
     mount_basic_fs();
+    raw_write("[DewOS] basic filesystems mounted\n");
 
     rootfs_ready = detect_rootfs();
+
+    show_boot_splash();
 
     if (rootfs_ready) {
         cmd_clear(CommandContext{});
@@ -56,7 +59,328 @@ int main() {
     return 0;
 }
 
-//-------------------------------------------------------------------------------------//
+
+void show_boot_splash() {
+    int fb = open("/dev/fb0", O_RDWR);
+
+    if (fb >= 0) {
+        fb_fix_screeninfo finfo{};
+        fb_var_screeninfo vinfo{};
+
+        if (ioctl(fb, FBIOGET_FSCREENINFO, &finfo) == 0 && ioctl(fb, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+            int bytes_per_pixel = vinfo.bits_per_pixel / 8;
+
+            if ((vinfo.bits_per_pixel == 16 || vinfo.bits_per_pixel == 24 || vinfo.bits_per_pixel == 32) &&
+                bytes_per_pixel > 0 && finfo.line_length > 0 && vinfo.xres > 0 && vinfo.yres > 0) {
+                size_t screen_size = finfo.smem_len;
+                if (screen_size == 0) {
+                    screen_size = finfo.line_length * vinfo.yres;
+                }
+
+                uint8_t* screen = (uint8_t*)mmap(nullptr, screen_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+
+                if (screen != MAP_FAILED) {
+                    auto pack_channel = [](uint8_t value, fb_bitfield field) -> uint32_t {
+                        if (field.length == 0) {
+                            return 0;
+                        }
+
+                        uint32_t max_value = (1u << field.length) - 1u;
+                        return ((uint32_t)value * max_value / 255u) << field.offset;
+                    };
+
+                    auto pixel_value = [&](uint8_t r, uint8_t g, uint8_t b) -> uint32_t {
+                        uint32_t pixel = 0;
+                        pixel |= pack_channel(r, vinfo.red);
+                        pixel |= pack_channel(g, vinfo.green);
+                        pixel |= pack_channel(b, vinfo.blue);
+                        return pixel;
+                    };
+
+                    auto put_pixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+                        if (x < 0 || y < 0 || x >= (int)vinfo.xres || y >= (int)vinfo.yres) {
+                            return;
+                        }
+
+                        size_t pos = y * finfo.line_length + x * bytes_per_pixel;
+                        if (pos + bytes_per_pixel > screen_size) {
+                            return;
+                        }
+
+                        uint32_t color = pixel_value(r, g, b);
+
+                        if (vinfo.bits_per_pixel == 32) {
+                            *(uint32_t*)(screen + pos) = color;
+                        } else if (vinfo.bits_per_pixel == 24) {
+                            screen[pos + (vinfo.red.offset / 8)] = r;
+                            screen[pos + (vinfo.green.offset / 8)] = g;
+                            screen[pos + (vinfo.blue.offset / 8)] = b;
+                        } else if (vinfo.bits_per_pixel == 16) {
+                            *(uint16_t*)(screen + pos) = (uint16_t)color;
+                        }
+                    };
+
+                    auto rect = [&](int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+                        for (int yy = y; yy < y + h; ++yy) {
+                            for (int xx = x; xx < x + w; ++xx) {
+                                put_pixel(xx, yy, r, g, b);
+                            }
+                        }
+                    };
+
+                    struct PpmImage {
+                        int width = 0;
+                        int height = 0;
+                        std::vector<uint8_t> pixels;
+                    };
+
+                    auto read_token = [](std::ifstream& file, std::string& token) -> bool {
+                        char ch = 0;
+                        token.clear();
+
+                        while (file.get(ch)) {
+                            if (ch == '#') {
+                                file.ignore(4096, '\n');
+                            } else if (ch > ' ') {
+                                token += ch;
+                                break;
+                            }
+                        }
+
+                        while (file.get(ch)) {
+                            if (ch == '#') {
+                                file.ignore(4096, '\n');
+                                break;
+                            }
+                            if (ch <= ' ') {
+                                break;
+                            }
+                            token += ch;
+                        }
+
+                        return !token.empty();
+                    };
+
+                    auto to_int = [](const std::string& text) -> int {
+                        int value = 0;
+
+                        if (text.empty()) {
+                            return -1;
+                        }
+
+                        for (char ch : text) {
+                            if (ch < '0' || ch > '9') {
+                                return -1;
+                            }
+
+                            value = value * 10 + (ch - '0');
+                        }
+
+                        return value;
+                    };
+
+                    auto load_ppm = [&](const std::string& path) -> PpmImage {
+                        PpmImage image;
+                        std::ifstream file(path, std::ios::binary);
+
+                        if (!file.is_open()) {
+                            return image;
+                        }
+
+                        std::string token;
+                        if (!read_token(file, token) || token != "P6") {
+                            return image;
+                        }
+
+                        if (!read_token(file, token)) {
+                            return image;
+                        }
+                        image.width = to_int(token);
+
+                        if (!read_token(file, token)) {
+                            return image;
+                        }
+                        image.height = to_int(token);
+
+                        if (!read_token(file, token) || to_int(token) != 255 ||
+                            image.width <= 0 || image.height <= 0) {
+                            image = {};
+                            return image;
+                        }
+
+                        image.pixels.resize((size_t)image.width * image.height * 3);
+                        file.read((char*)image.pixels.data(), image.pixels.size());
+
+                        if ((size_t)file.gcount() != image.pixels.size()) {
+                            image = {};
+                        }
+
+                        return image;
+                    };
+
+                    auto draw_image = [&](const PpmImage& image, int x0, int y0, int w, int h) {
+                        if (image.pixels.empty() || w <= 0 || h <= 0) {
+                            return;
+                        }
+
+                        for (int y = 0; y < h; ++y) {
+                            int src_y = y * image.height / h;
+
+                            for (int x = 0; x < w; ++x) {
+                                int src_x = x * image.width / w;
+                                size_t pos = ((size_t)src_y * image.width + src_x) * 3;
+                                put_pixel(x0 + x, y0 + y,
+                                          image.pixels[pos],
+                                          image.pixels[pos + 1],
+                                          image.pixels[pos + 2]);
+                            }
+                        }
+                    };
+
+                    rect(0, 0, vinfo.xres, vinfo.yres, 0, 0, 0);
+
+                    PpmImage logo = load_ppm("/etc/dewos-logo.ppm");
+
+                    if (!logo.pixels.empty()) {
+                        int logo_h = vinfo.yres / 3;
+                        int logo_w = logo.width * logo_h / logo.height;
+
+                        if (logo_w > (int)vinfo.xres / 2) {
+                            logo_w = vinfo.xres / 2;
+                            logo_h = logo.height * logo_w / logo.width;
+                        }
+
+                        int logo_x = ((int)vinfo.xres - logo_w) / 2;
+                        int logo_y = ((int)vinfo.yres / 2) - logo_h / 2 - 70;
+                        draw_image(logo, logo_x, logo_y, logo_w, logo_h);
+                    }
+
+                    int loader_size = vinfo.yres / 12;
+                    if (loader_size < 48) {
+                        loader_size = 48;
+                    }
+                    if (loader_size > 96) {
+                        loader_size = 96;
+                    }
+
+                    int loader_x = ((int)vinfo.xres - loader_size) / 2;
+                    int loader_y = ((int)vinfo.yres / 2) + vinfo.yres / 5;
+                    int loader_cx = loader_x + loader_size / 2;
+                    int loader_cy = loader_y + loader_size / 2;
+                    int loader_radius = loader_size / 2 - 6;
+                    int loader_thick = loader_size / 16;
+
+                    if (loader_thick < 4) {
+                        loader_thick = 4;
+                    }
+
+                    const int circle_points[32][2] = {
+                        {0, -100}, {20, -98}, {38, -92}, {56, -83},
+                        {71, -71}, {83, -56}, {92, -38}, {98, -20},
+                        {100, 0}, {98, 20}, {92, 38}, {83, 56},
+                        {71, 71}, {56, 83}, {38, 92}, {20, 98},
+                        {0, 100}, {-20, 98}, {-38, 92}, {-56, 83},
+                        {-71, 71}, {-83, 56}, {-92, 38}, {-98, 20},
+                        {-100, 0}, {-98, -20}, {-92, -38}, {-83, -56},
+                        {-71, -71}, {-56, -83}, {-38, -92}, {-20, -98}
+                    };
+
+                    auto draw_round_pixel = [&](int x, int y, int radius, uint8_t r, uint8_t g, uint8_t b) {
+                        for (int yy = -radius; yy <= radius; ++yy) {
+                            for (int xx = -radius; xx <= radius; ++xx) {
+                                if (xx * xx + yy * yy <= radius * radius) {
+                                    put_pixel(x + xx, y + yy, r, g, b);
+                                }
+                            }
+                        }
+                    };
+
+                    auto draw_loader_segment = [&](int x0, int y0, int x1, int y1,
+                                                   uint8_t r, uint8_t g, uint8_t b) {
+                        int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+                        int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+                        int sx = x0 < x1 ? 1 : -1;
+                        int sy = y0 < y1 ? 1 : -1;
+                        int err = dx - dy;
+
+                        while (true) {
+                            draw_round_pixel(x0, y0, loader_thick, r, g, b);
+
+                            if (x0 == x1 && y0 == y1) {
+                                break;
+                            }
+
+                            int e2 = err * 2;
+
+                            if (e2 > -dy) {
+                                err -= dy;
+                                x0 += sx;
+                            }
+
+                            if (e2 < dx) {
+                                err += dx;
+                                y0 += sy;
+                            }
+                        }
+                    };
+
+                    for (int frame = 0; frame < 80; ++frame) {
+                        rect(loader_x - 10, loader_y - 10, loader_size + 20, loader_size + 20, 0, 0, 0);
+
+                        int start = frame % 32;
+
+                        for (int part = 0; part < 11; ++part) {
+                            int index = (start + part) % 32;
+                            int next = (index + 1) % 32;
+                            int power = 70 + part * 17;
+
+                            if (power > 255) {
+                                power = 255;
+                            }
+
+                            int x0 = loader_cx + circle_points[index][0] * loader_radius / 100;
+                            int y0 = loader_cy + circle_points[index][1] * loader_radius / 100;
+                            int x1 = loader_cx + circle_points[next][0] * loader_radius / 100;
+                            int y1 = loader_cy + circle_points[next][1] * loader_radius / 100;
+
+                            draw_loader_segment(x0, y0, x1, y1,
+                                                10 + power / 8,
+                                                85 + power / 2,
+                                                140 + power / 3);
+                        }
+
+                        usleep(50000);
+                    }
+
+                    munmap(screen, screen_size);
+                    close(fb);
+                    raw_write("\033[2J\033[H");
+                    return;
+                }
+            }
+        }
+
+        close(fb);
+    }
+
+    raw_write("\033[?25l");
+    raw_write("\033[2J\033[H");
+    raw_write("\033[10;30HDEWOS\n");
+
+    const char* spinner[] = {"|", "/", "-", "\\"};
+    for (int i = 0; i < 32; ++i) {
+        raw_write("\033[20;40H");
+        raw_write(spinner[i % 4]);
+        usleep(45000);
+    }
+
+    raw_write("\033[2J\033[H");
+}
+
+
+//#######################################################################################//
+//######                             CONSOLE SETUP                                 ######//
+//#######################################################################################//
 
 void setup_console() {
     mkdir("/dev", 0755);
@@ -71,6 +395,10 @@ void setup_console() {
         if (errno != EEXIST) {
             critical_error("DEVTMPFS_MKNOD_CONSOLE_FAILED", 0xDE771002);
         }
+    }
+
+    if (mknod("/dev/fb0", S_IFCHR | 0600, makedev(29, 0)) < 0 && errno != EEXIST) {
+        print_error("dev: failed to create /dev/fb0");
     }
 
     int tty = open("/dev/tty1", O_RDWR);
@@ -92,6 +420,7 @@ void setup_console() {
     }
 }
 
+
 void mount_basic_fs() {
     mkdir("/proc", 0555);
     mkdir("/sys", 0555);
@@ -106,53 +435,15 @@ void mount_basic_fs() {
     }
 }
 
-//-------------------------------------------------------------------------------------//
+
+//#######################################################################################//
+//######                             CRITICAL ERRORS                               ######//
+//#######################################################################################//
 
 void print_error(const std::string& message) {
     std::cerr << "ERROR: " << message << std::endl;
 }
 
-void shell_loop() {
-    std::vector<Command> commands = create_commands();
-
-    while (true) {
-        std::string input = read_line(make_prompt());
-
-        scroll_offset = 0;
-
-        CommandContext ctx = parse_command(input);
-
-        if (ctx.name == "help") {
-            cmd_help(ctx, commands);
-            continue;
-        }
-
-        exec_command(ctx, commands);
-    }
-}
-
-void emergency_print(const char* str, int x, int y, uint8_t color) {
-    volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
-    int offset = y * 80 + x;
-
-    for (int i = 0; str[i] != '\0'; ++i) {
-        vga[offset + i] = (uint16_t)str[i] | ((uint16_t)color << 8);
-    }
-}
-
-void hex_to_str(uint32_t n, char* out) {
-    const char* hex_chars = "0123456789ABCDEF";
-    
-    out[0] = '0';
-    out[1] = 'x';
-    
-    for (int i = 7; i >= 0; --i) {
-        out[i + 2] = hex_chars[n & 0xF];
-        n >>= 4;
-    }
-    
-    out[10] = '\0';
-}
 
 void critical_error(const char* message, uint32_t error_code) {
     uint16_t* vga = (uint16_t*)0xB8000;
@@ -199,1191 +490,26 @@ void critical_error(const char* message, uint32_t error_code) {
     }
 }
 
-//-------------------------------------------------------------------------------------//
+void emergency_print(const char* str, int x, int y, uint8_t color) {
+    volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+    int offset = y * 80 + x;
 
-CommandContext parse_command(const std::string& input) {
-    CommandContext ctx;
-    ctx.raw = input;
-
-    std::stringstream ss(input);
-    std::string word;
-
-    if (ss >> word) {
-        ctx.name = word;
-    }
-
-    while (ss >> word) {
-        if (word[0] == '-') {
-            ctx.flags.push_back(word);
-        } else {
-            ctx.args.push_back(word);
-        }
-    }
-
-    return ctx;
-}
-
-std::vector<Command> create_commands() {
-    std::vector<Command> commands;
-
-    commands.push_back(Command{"about", "Display information about DewOS", cmd_about});
-    commands.push_back(Command{"poweroff", "Power off the system", sys_poweroff});
-    commands.push_back(Command{"reboot", "Reboot the system", sys_reboot});
-    commands.push_back(Command{"clear", "Clear the console screen", cmd_clear});
-    commands.push_back(Command{"echo", "Print the provided text to the console", cmd_echo});
-    commands.push_back(Command{"pwd", "Print the current working directory", cmd_pwd});
-    commands.push_back(Command{"ls", "List files in the current directory", cmd_ls});
-    commands.push_back(Command{"cd", "Change the current directory", cmd_cd});
-    commands.push_back(Command{"mkdir", "Create a new directory", cmd_mkdir});
-    commands.push_back(Command{"touch", "Create a new empty file or update timestamp of existing file", cmd_touch});
-    commands.push_back(Command{"rm", "Remove a file or directory (with flag -r for recursive)", cmd_rm});
-    commands.push_back(Command{"cat", "Display contents of a file", cmd_cat});
-    commands.push_back(Command{"kilo", "Open a file in the kilo text editor", cmd_kilo});
-    commands.push_back(Command{"dewfetch", "Print system information", cmd_dewfetch});
-    commands.push_back(Command{"ps", "List running processes", cmd_ps});
-    commands.push_back(Command{"whoami", "Print current logged in user", cmd_whoami});
-    commands.push_back(Command{"id", "Print current user id", cmd_id});
-    commands.push_back(Command{"install", "Start DewOS installer", cmd_install});
-    commands.push_back(Command{"sh", "Start BusyBox shell", cmd_sh});
-    commands.push_back(Command{"umount", "Unmount path", cmd_umount});
-    commands.push_back(Command{"su", "Switch user", cmd_su});
-    commands.push_back(Command{"netlog", "Show network startup log", cmd_netlog});
-
-    return commands;
-}
-
-void exec_command(const CommandContext& ctx, const std::vector<Command>& commands) {
-    if (ctx.name.empty()) {
-        return;
-    }
-
-    for (const auto& cmd : commands) {
-        if (cmd.name == ctx.name) {
-            cmd.handler(ctx);
-            return;
-        }
-    }
-
-    cmd_unknown(ctx);
-}
-
-//-------------------------------------------------------------------------------------//
-
-void cmd_about(const CommandContext& ctx) {
-    (void)ctx;
-
-    shell_print("DewOS is a simple Linux distribution\n");
-    shell_print("Author: ArtemyStudio (artemystudio.co@gmail.com)\n");
-}
-
-void cmd_help(const CommandContext& ctx, const std::vector<Command>& commands) {
-    (void)ctx;
-
-    shell_print("Available commands:\n");
-    shell_print("  help - Display available commands\n");
-
-    for (const Command& cmd : commands) {
-        shell_print("  " + cmd.name + " - " + cmd.description + "\n");
+    for (int i = 0; str[i] != '\0'; ++i) {
+        vga[offset + i] = (uint16_t)str[i] | ((uint16_t)color << 8);
     }
 }
 
-void cmd_clear(const CommandContext& ctx) {
-    (void)ctx;
-    shell_print("\033[2J\033[H");
-}
 
-void cmd_echo(const CommandContext& ctx) {
-    for (const std::string& arg : ctx.args) {
-        shell_print(arg + " ");
-    }
-    shell_print("\n");
-}
-
-void cmd_whoami(const CommandContext& ctx) {
-    (void)ctx;
-
-    shell_print(current_user + "\n");
-}
-
-void cmd_id(const CommandContext& ctx) {
-    (void)ctx;
-
-    shell_print("uid=" + std::to_string(current_uid));
-    shell_print("(" + current_user + ") ");
-    shell_print("gid=" + std::to_string(current_gid) + "\n");
-}
-
-void cmd_logout(const CommandContext& ctx) {
-    (void)ctx;
-
-    disable_raw_mode();
-    raw_write("\033[?25h");
-    cmd_clear(CommandContext{});
-
-    login_loop();
-
-    enable_raw_mode();
-    raw_write("\033[?25l");
-
-    cmd_clear(CommandContext{});
-    print_banner();
-}
-
-void cmd_install(const CommandContext& ctx) {
-    (void)ctx;
-
-    shell_print("[DewOS] Starting installer...\n");
-
-    disable_raw_mode();
-    raw_write("\033[?25h");
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        shell_print("[DewOS] fork failed\n");
-        enable_raw_mode();
-        raw_write("\033[?25l");
-        return;
-    }
-
-    if (pid == 0) {
-        const char* path = "/sbin/dew-install";
-        char* const args[] = {
-            (char*)path,
-            NULL
-        };
-
-        execv(path, args);
-
-        perror("execv /sbin/dew-install failed");
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    enable_raw_mode();
-    raw_write("\033[?25l");
-
-    shell_print("\n[DewOS] Installer exited.\n");
-
-    rootfs_ready = detect_rootfs();
-}
-
-void cmd_umount(const CommandContext& ctx) {
-    (void)ctx;
-
-    if (ctx.args.empty()) {
-        shell_print("usage: umount <path>\n");
-        return;
-    }
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        shell_print("umount: fork failed\n");
-        return;
-    }
-
-    if (pid == 0) {
-        const char* target = ctx.args[0].c_str();
-
-        {
-            const char* path = "/bin/umount";
-            char* const args[] = {
-                (char*)path,
-                (char*)target,
-                nullptr
-            };
-
-            execv(path, args);
-        }
-
-        {
-            const char* path = "/sbin/umount";
-            char* const args[] = {
-                (char*)path,
-                (char*)target,
-                nullptr
-            };
-
-            execv(path, args);
-        }
-
-        perror("execv umount failed");
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-}
-
-void print_banner() {
-    shell_print("██████╗ ███████╗██╗    ██╗ ██████╗ ███████╗\n");
-    shell_print("██╔══██╗██╔════╝██║    ██║██╔═══██╗██╔════╝\n");
-    shell_print("██║  ██║█████╗  ██║ █╗ ██║██║   ██║███████╗\n");
-    shell_print("██║  ██║██╔══╝  ██║███╗██║██║   ██║╚════██║\n");
-    shell_print("██████╔╝███████╗╚███╔███╔╝╚██████╔╝███████║\n");
-    shell_print("╚═════╝ ╚══════╝ ╚══╝╚══╝  ╚═════╝ ╚══════╝\n");
-    shell_print("\n");
-}
-
-//-------------------------------------------------------------------------------------//
-
-void sys_poweroff(const CommandContext& ctx) {
-    (void)ctx;
-    shell_print("Powering off...\n");
-
-    sync();
-    reboot(LINUX_REBOOT_CMD_POWER_OFF);
-}
-
-void sys_reboot(const CommandContext& ctx) {
-    (void)ctx;
-    shell_print("Rebooting...\n");
-
-    sync();
-    reboot(LINUX_REBOOT_CMD_RESTART);
-}
-
-//-------------------------------------------------------------------------------------//
-
-void cmd_pwd(const CommandContext& ctx) {
-    (void)ctx;
-
-    if (!require_rootfs("pwd")) return;
-
-    char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)) != nullptr) {
-        shell_print(std::string(cwd) + "\n");
-    } else {
-        print_error("Failed to get current working directory");
-    }
-}
-
-void cmd_ls(const CommandContext& ctx) {
-    (void)ctx;
-
-    if (!require_rootfs("ls")) return;
-
-    std::string path = ctx.args.empty() ? "." : ctx.args[0];
-
-    DIR* dir = opendir(path.c_str());
-    if (!dir) {
-        print_error("ls: failed to open " + path);
-        return;
-    }
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        shell_print(std::string(entry->d_name) + "  ");
-    }
-
-    shell_print("\n");
-    closedir(dir);
-}
-
-void cmd_cd(const CommandContext& ctx) {
-    if (!require_rootfs("cd")) return;
-
-    if (ctx.args.empty()) {
-        print_error("No directory specified");
-        return;
-    }
-
-    if (chdir(ctx.args[0].c_str()) < 0) {
-        print_error("Failed to change directory");
-    }
-}
-
-void cmd_mkdir(const CommandContext& ctx) {
-    if (!require_rootfs("mkdir")) return;
-
-    if (ctx.args.empty()) {
-        print_error("No directory name specified");
-        return;
-    }
-
-    if (mkdir(ctx.args[0].c_str(), 0755) < 0) {
-        print_error("Failed to create directory");
-    }
-}
-
-void cmd_touch(const CommandContext& ctx) {
-    if (!require_rootfs("touch")) return;
-
-    if (ctx.args.empty()) {
-        print_error("No file name specified");
-        return;
-    }
-
-    int fd = open(ctx.args[0].c_str(), O_CREAT | O_WRONLY, 0644);
-    if (fd < 0) {
-        print_error("Failed to create file");
-        return;
-    }
-    close(fd);
-}
-
-void cmd_rm(const CommandContext& ctx) {
-    if (!require_rootfs("rm")) return;
-
-    if (ctx.args.empty()) {
-        print_error("No file or directory specified");
-        return;
-    }
-
-    const char* path = ctx.args[0].c_str();
-
-    if (ctx.has_flag("-r")) {
-        shell_print("Recursively removing directory is not implemented yet.\n");
-    } else {
-        if (remove(path) < 0) {
-            print_error("Failed to remove file or directory");
-        }
-    }
-}
-
-void cmd_cat(const CommandContext& ctx) {
-    if (!require_rootfs("cat")) return;
-
-    if (ctx.args.empty()) {
-        print_error("No file specified");
-        return;
-    }
-
-    const char* path = ctx.args[0].c_str();
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        print_error("Failed to open file");
-        return;
-    }
-
-    char buffer[1024];
-    ssize_t bytesRead;
-    while ((bytesRead = read(fd, buffer, sizeof(buffer))) > 0) {
-        shell_print(std::string(buffer, bytesRead));
-    }
-    shell_print("\n");
-
-    close(fd);
-}
-
-//-------------------------------------------------------------------------------------//
-
-void cmd_kilo(const CommandContext& ctx) {
-    if (ctx.args.empty()) {
-        print_error("kilo: missing file");
-        return;
-    }
-
-    kilo_editor(ctx, ctx.args[0].c_str());
-}
-
-void kilo_editor(const CommandContext& ctx, const char* filename) {
-    (void)ctx;
-
-    pid_t pid = fork();
-
-    if (pid == -1) {
-        perror("fork failed");
-        return;
-    }
-
-    if (pid == 0) {
-        int tty = open("/dev/tty1", O_RDWR);
-
-        if (tty >= 0) {
-            dup2(tty, 0);
-            dup2(tty, 1);
-            dup2(tty, 2);
-
-            if (tty > 2) {
-                close(tty);
-            }
-        }
-
-        setenv("TERM", "linux", 1);
-
-        const char* path = "/bin/kilo";
-        char* const args[] = {
-            (char*)path,
-            (char*)filename,
-            NULL
-        };
-
-        execv(path, args);
-
-        perror("execv failed");
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    shell_print("\033[2J\033[H");
-
-    if (WIFEXITED(status)) {
-        shell_print("kilo exited with code: " + std::to_string(WEXITSTATUS(status)) + "\n");
-    } else if (WIFSIGNALED(status)) {
-        shell_print("kilo killed by signal: " + std::to_string(WTERMSIG(status)) + "\n");
-    } else {
-        shell_print("kilo returned with unknown status\n");
-    }
-
-    shell_print("Returned to DewOS Init.\n");
-}
-
-//-------------------------------------------------------------------------------------//
-
-void cmd_dewfetch(const CommandContext& ctx) {
-    (void)ctx;
-    struct utsname sys;
-    uname(&sys);
-
-    std::string uptime_str = "unknown";
-    std::ifstream uf("/proc/uptime");
-    if (uf.is_open()) {
-        std::string raw;
-        if (uf >> raw) {
-            size_t dot = raw.find('.');
-            if (dot != std::string::npos) raw = raw.substr(0, dot);
-            try {
-                long long sec = std::stoll(raw);
-                uptime_str = std::to_string(sec / 3600) + "h " + std::to_string((sec % 3600) / 60) + "m";
-            } catch (...) {}
-        }
-        uf.close();
-    }
-
-    std::string mem_str = "unknown";
-    std::ifstream mf("/proc/meminfo");
-    if (mf.is_open()) {
-        long total = 0, avail = 0;
-        std::string line;
-        while (std::getline(mf, line)) {
-            if (line.find("MemTotal:") == 0) {
-                sscanf(line.c_str(), "MemTotal: %ld", &total);
-            } else if (line.find("MemAvailable:") == 0 || line.find("MemFree:") == 0) {
-                if (avail == 0) sscanf(line.c_str(), line.find("MemAvailable:") == 0 ? "MemAvailable: %ld" : "MemFree: %ld", &avail);
-            }
-        }
-        if (total > 0) {
-            mem_str = std::to_string((total - avail) / 1024) + "MiB / " + std::to_string(total / 1024) + "MiB";
-        }
-        mf.close();
-    }
-
-    int pkg_count = 0;
-    DIR* dir = opendir("/usr/bin");
-    if (dir) {
-        while (readdir(dir)) pkg_count++;
-        closedir(dir);
-        if (pkg_count > 2) pkg_count -= 2;
-    }
-
-    std::vector<std::string> logo = {
-        std::string(LIGHT_BLUE) + "          .::--==++**░▒▓▓▓▓▓▓▒░:.              " + RESET,
-        std::string(LIGHT_BLUE) + "             .:-=+*░▒▓" + BLUE + "████████████▄           " + RESET,
-        std::string(LIGHT_BLUE) + "                .-=*▒▓" + BLUE + "██████████████▄         " + RESET,
-        std::string(LIGHT_BLUE) + "                    .:+▓" + BLUE + "████████████▓▓       " + RESET,
-        std::string(BLUE)       + "                              ▐████████▌      " + RESET,
-        std::string(BLUE)       + "                                ▐████████▌    " + RESET,
-        std::string(BLUE)       + "                                  ▐███████▌   " + RESET,
-        std::string(BLUE)       + "                                    ▐██████▌  " + RESET,
-        std::string(BLUE)       + "                                  ▄███████▀   " + RESET,
-        std::string(BLUE)       + "                                ▄████████▀    " + RESET,
-        std::string(BLUE)       + "                              ▄████████▀      " + RESET,
-        std::string(LIGHT_BLUE) + "                    .:+▓" + BLUE + "██████████████▀       " + RESET,
-        std::string(LIGHT_BLUE) + "                .-=*▒▓" + BLUE + "██████████████▀         " + RESET,
-        std::string(LIGHT_BLUE) + "             .:-=+*░▒▓" + BLUE + "████████████▀           " + RESET,
-        std::string(LIGHT_BLUE) + "          .::--==++**░▒▓▓▓▓▓▒░:.              " + RESET
-    };
-
-    std::string host = sys.nodename;
-    if (host == "(none)" || host.empty()) host = "dewos";
-
-    shell_print("\n");
-    for (size_t i = 0; i < logo.size(); ++i) {
-        shell_print("  " + logo[i]);
-
-        switch(i) {
-            case 1:  shell_print("  " + std::string(BOLD) + BLUE + "dewos" + RESET + "@" + BOLD + BLUE + host); break;
-            case 2:  shell_print("  ------------"); break;
-            case 3:  shell_print("   " + std::string(BOLD) + BLUE + "os     " + RESET + "DewOS"); break;
-            case 4:  shell_print("  " + std::string(BOLD) + BLUE + "kernel " + RESET + sys.release); break;
-            case 5:  shell_print("  " + std::string(BOLD) + BLUE + "uptime " + RESET + uptime_str); break;
-            case 6:  shell_print("  " + std::string(BOLD) + BLUE + "pkgs   " + RESET + std::to_string(pkg_count) + " (bin)"); break;
-            case 7:  shell_print("  " + std::string(BOLD) + BLUE + "memory " + RESET + mem_str); break;
-            case 9:  shell_print("  " + std::string("\033[41m  \033[42m  \033[43m  \033[44m  \033[45m  \033[0m")); break;
-        }
-
-        shell_print("\n");
-    }
-
-    shell_print("\n");
-}
-
-void cmd_ps(const CommandContext& ctx) {
-    (void)ctx;
-
-    DIR* dir = opendir("/proc");
-    if (!dir) return;
-
-    long page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
-
-    shell_print(std::string(BOLD) + CYN + "╭──────────┬──────────────────────┬────────────┬──────────────────────╮" + RESET + "\n");
-    shell_print(std::string(BOLD) + CYN + "│" + RESET + BOLD + "  PID     " + CYN + "│" + RESET + BOLD + "  COMMAND             " + CYN + "│" + RESET + BOLD + "  RAM       " + CYN + "│" + RESET + BOLD + "  STATUS              " + CYN + "│" + RESET + "\n");
-    shell_print(std::string(BOLD) + CYN + "├──────────┼──────────────────────┼────────────┼──────────────────────┤" + RESET + "\n");
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
-            std::string pid = entry->d_name;
-            std::string path = "/proc/" + pid;
-
-            std::ifstream comm_file(path + "/comm");
-            std::string command;
-            std::getline(comm_file, command);
-            if (command.length() > 18) command = command.substr(0, 15) + "...";
-            if (command.empty()) command = "kernel_task";
-
-            std::ifstream stat_file(path + "/stat");
-            std::string dummy, state_code;
-            stat_file >> dummy >> dummy >> state_code;
-
-            std::string state_display;
-            if (state_code == "R")      state_display = std::string(GNR) + "󰐊 Run" + RESET;
-            else if (state_code == "S") state_display = std::string(CYN) + "󰒲 Slp" + RESET;
-            else if (state_code == "Z") state_display = std::string(RED) + "󰚑 Zmb" + RESET;
-            else                        state_display = state_code;
-
-            std::ifstream statm_file(path + "/statm");
-            long pages;
-            statm_file >> pages;
-            std::string ram_usage = std::to_string(pages * page_size_kb) + "K";
-
-            std::stringstream ss;
-            ss << std::string(BOLD) << CYN << "│ " << RESET << std::left << std::setw(9) << pid
-            << BOLD << CYN << "│ " << RESET << std::left << std::setw(21) << command
-            << BOLD << CYN << "│ " << RESET << std::left << std::setw(11) << ram_usage
-            << BOLD << CYN << "│ " << RESET << std::left << std::setw(30) << state_display
-            << BOLD << CYN << "│" << RESET << "\n";
-
-            shell_print(ss.str());
-        }
-    }
-
-    shell_print(std::string(BOLD) + CYN + "╰──────────┴──────────────────────┴────────────┴──────────────────────╯" + RESET + "\n");
-    closedir(dir);
-}
-
-//-------------------------------------------------------------------------------------//
-
-void enable_raw_mode() {
-    if (tcgetattr(0, &original_termios) < 0) {
-        print_error("tcgetattr failed");
-        return;
-    }
-
-    termios raw = original_termios;
-
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-
-    if (tcsetattr(0, TCSAFLUSH, &raw) < 0) {
-        print_error("tcsetattr failed");
-    }
-}
-
-void disable_raw_mode() {
-    tcsetattr(0, TCSAFLUSH, &original_termios);
-}
-
-std::string read_line(const std::string& prompt) {
-    std::string line;
-    size_t cursor = 0;
-
-    bool cursor_visible = true;
-
-    history_index = history.size();
-
-    redraw_line(prompt, line, cursor, cursor_visible);
-
-    while (true) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(0, &readfds);
-
-        timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 250000; 
-
-        int ready = select(1, &readfds, nullptr, nullptr, &timeout);
-
-        if (ready == 0) {
-            cursor_visible = !cursor_visible;
-            redraw_line(prompt, line, cursor, cursor_visible);
-            continue; 
-        }
-
-        if (ready < 0) {
-            continue;
-        }
-
-        char c;
-        if (read(0, &c, 1) != 1) {
-            continue;
-        }
-
-        if (c == '\n' || c == '\r') {
-            redraw_line(prompt, line, cursor, false);
-            raw_write("\n");
-
-            if (!line.empty()) {
-                history.push_back(line);
-            }
-
-            return line;
-        }
-
-        if (c == 127 || c == '\b') {
-            if (cursor > 0) {
-                line.erase(line.begin() + cursor - 1);
-                cursor--;
-                redraw_line(prompt, line, cursor, cursor_visible);
-            }
-
-            continue;
-        }
-
-        if (c == '\033') {
-            char seq[3];
-
-            if (read(0, &seq[0], 1) != 1) {
-                continue;
-            }
-
-            if (read(0, &seq[1], 1) != 1) {
-                continue;
-            }
-
-            if (seq[0] == '[') {
-                if (seq[1] == 'A') {
-                    if (!history.empty() && history_index > 0) {
-                        history_index--;
-                        line = history[history_index];
-                        cursor = line.size();
-                        redraw_line(prompt, line, cursor, cursor_visible);
-                    }
-                }
-                else if (seq[1] == 'B') {
-                    if (history_index + 1 < history.size()) {
-                        history_index++;
-                        line = history[history_index];
-                    } else {
-                        history_index = history.size();
-                        line.clear();
-                    }
-
-                    cursor = line.size();
-                    redraw_line(prompt, line, cursor, cursor_visible);
-                }
-                else if (seq[1] == 'C') {
-                    if (cursor < line.size()) {
-                        cursor++;
-                        redraw_line(prompt, line, cursor, cursor_visible);
-                    }
-                }
-                else if (seq[1] == 'D') {
-                    if (cursor > 0) {
-                        cursor--;
-                        redraw_line(prompt, line, cursor, cursor_visible);
-                    }
-                }
-                else if (seq[1] == '5' || seq[1] == '6') {
-                    char tilde;
-                    if (read(0, &tilde, 1) != 1) {
-                        continue;
-                    }
-
-                    if (tilde == '~') {
-                        if (seq[1] == '5') {
-                            scroll_up();
-                        } else {
-                            scroll_down();
-                        }
-                    }
-                }
-            }
-
-            continue;
-        }
-
-        if (c >= 32 && c <= 126) {
-            scroll_offset = 0; 
-            line.insert(line.begin() + cursor, c);
-            cursor++;
-            redraw_line(prompt, line, cursor, cursor_visible);
-        }
-    }
-}   
-
-void raw_write(const std::string& text) {
-    (void)!write(STDOUT_FILENO, text.c_str(), text.size());
-}
-
-void redraw_line(const std::string& prompt, const std::string& line, size_t cursor, bool cursor_visible) {
-    if (cursor > line.size()) {
-        cursor = line.size();
-    }
-
-    raw_write("\r");
-    raw_write("\033[K");
-    raw_write(prompt);
-
-    std::string before = line.substr(0, cursor);
-    std::string after = line.substr(cursor);
-
-    raw_write(before);
-
-    if (cursor_visible) {
-        raw_write("|");
-    } else {
-        raw_write(" ");
-    }
-
-    raw_write(after);
-    raw_write("\033[K");
-
-    size_t chars_right = after.size();
-
-    if (chars_right > 0) {
-        raw_write("\033[" + std::to_string(chars_right) + "D");
-    }
-}
-
-//-------------------------------------------------------------------------------------//
-
-void scroll_up() {
-    int total = static_cast<int>(scrollback.size());
-
-    if (total <= SCREEN_ROWS) {
-        return;
-    }
-
-    scroll_offset += 5;
-
-    int max_offset = total - SCREEN_ROWS;
-    if (scroll_offset > max_offset) {
-        scroll_offset = max_offset;
-    }
-
-    redraw_screen_scroll();
-}
-
-void scroll_down() {
-    scroll_offset -= 5;
-
-    if (scroll_offset < 0) {
-        scroll_offset = 0;
-    }
-
-    redraw_screen_scroll();
-}
-
-void redraw_screen_scroll() {
-    raw_write("\033[2J\033[H");
-
-    int total = static_cast<int>(scrollback.size());
-    int visible = SCREEN_ROWS - 2;
-
-    int start = total - visible - scroll_offset;
-    if (start < 0) {
-        start = 0;
-    }
-
-    int end = start + visible;
-    if (end > total) {
-        end = total;
-    }
-
-    for (int i = start; i < end; i++) {
-        raw_write(scrollback[i] + "\n");
-    }
-}
-
-void shell_print(const std::string& text) {
-    raw_write(text);
-
-    static std::string current_line;
-
-    for (char c : text) {
-        if (c == '\r') {
-            continue;
-        }
-
-        if (c == '\033') {}
-
-        if (c == '\n') {
-            if (!current_line.empty()) {
-                scrollback.push_back(current_line);
-                current_line.clear();
-            }
-        } else {
-            current_line.push_back(c);
-        }
-    }
-
-    if (scrollback.size() > 1000) {
-        scrollback.erase(scrollback.begin(), scrollback.begin() + 100);
-    }
-}
-
-//------------------------------------------------------------------------------------//
-
-void login_loop() {
-    while (true) {
-        if (login_once()) {
-            return;
-        }
-    }
-}
-
-bool login_once() {
-    std::string username;
-
-    std::cout << "login: " << std::flush;
-    std::getline(std::cin, username);
-
-    if (username.empty()) {
-        return false;
-    }
-
-    LoginUser user;
-
-    if (!load_user_from_files(username, user)) {
-        std::cout << "Login incorrect\n";
-        return false;
-    }
-
-    std::string password = read_password("password: ");
-
-    if (!verify_password(password, user.password_hash)) {
-        std::cout << "Login incorrect\n";
-        return false;
-    }
-
-    current_user = user.name;
-    current_uid = user.uid;
-    current_gid = user.gid;
-    current_home = user.home;
-
-    if (!current_home.empty()) {
-        if (chdir(current_home.c_str()) != 0) {
-            print_error("login: failed to change home directory");
-        }
-    }
-
-    std::cout << "Welcome to DewOS, " << current_user << "\n";
-    return true;
-}
-
-bool load_user_from_files(const std::string& username, LoginUser& user) {
-    std::ifstream passwd_file("/etc/passwd");
-
-    if (!passwd_file.is_open()) {
-        print_error("login: cannot open /etc/passwd");
-        return false;
-    }
-
-    std::string line;
-    bool found_passwd = false;
-
-    while (std::getline(passwd_file, line)) {
-        std::vector<std::string> parts = split_string(line, ':');
-
-        if (parts.size() < 7) {
-            continue;
-        }
-
-        if (parts[0] == username) {
-            user.name = parts[0];
-            user.uid = std::stoi(parts[2]);
-            user.gid = std::stoi(parts[3]);
-            user.home = parts[5];
-            user.shell = parts[6];
-
-            found_passwd = true;
-            break;
-        }
-    }
-
-    passwd_file.close();
-
-    if (!found_passwd) {
-        return false;
-    }
-
-    std::ifstream shadow_file("/etc/shadow");
-
-    if (!shadow_file.is_open()) {
-        print_error("login: cannot open /etc/shadow");
-        return false;
-    }
-
-    bool found_shadow = false;
-
-    while (std::getline(shadow_file, line)) {
-        std::vector<std::string> parts = split_string(line, ':');
-
-        if (parts.size() < 2) {
-            continue;
-        }
-
-        if (parts[0] == username) {
-            user.password_hash = parts[1];
-            found_shadow = true;
-            break;
-        }
-    }
-
-    shadow_file.close();
-
-    return found_shadow;
-}
-
-std::string read_password(const std::string& prompt) {
-    std::cout << prompt << std::flush;
-
-    termios old_termios;
-    termios new_termios;
-
-    if (tcgetattr(STDIN_FILENO, &old_termios) < 0) {
-        std::string fallback;
-        std::getline(std::cin, fallback);
-        return fallback;
-    }
-
-    new_termios = old_termios;
-    new_termios.c_lflag &= ~ECHO;
-
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &new_termios);
-
-    std::string password;
-    std::getline(std::cin, password);
-
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_termios);
-
-    std::cout << "\n";
-    return password;
-}
-
-bool verify_password(const std::string& password, const std::string& hash) {
-    if (hash.empty() || hash == "*" || hash == "!") {
-        return false;
-    }
-
-    char* result = crypt(password.c_str(), hash.c_str());
-
-    if (result == nullptr) {
-        return false;
-    }
-
-    return hash == result;
-}
-
-std::vector<std::string> split_string(const std::string& text, char sep) {
-    std::vector<std::string> parts;
-    std::string current;
-
-    for (char c : text) {
-        if (c == sep) {
-            parts.push_back(current);
-            current.clear();
-        } else {
-            current.push_back(c);
-        }
-    }
-
-    parts.push_back(current);
-    return parts;
-}
-
-std::string make_prompt() {
-    return "[dewos@" + current_user + "]# ";
-}
-
-//------------------------------------------------------------------------------------//
-
-bool detect_rootfs() {
-    return access("/etc/dewos-installed", F_OK) == 0;
-}
-
-bool require_rootfs(const std::string& command_name) {
-    if (rootfs_ready) {
-        return true;
-    }
-
-    shell_print(command_name + ": unavailable before install/rootfs mount\n");
-    return false;
-}
-
-//------------------------------------------------------------------------------------//
-
-void cmd_sh(const CommandContext& ctx) {
-    (void)ctx;
-
-    shell_print("[DewOS] Starting /bin/sh...\n");
-
-    disable_raw_mode();
-    raw_write("\033[?25h");
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        shell_print("[DewOS] fork failed\n");
-        enable_raw_mode();
-        raw_write("\033[?25l");
-        return;
-    }
-
-    if (pid == 0) {
-        const char* path = "/bin/sh";
-        char* const args[] = {
-            (char*)path,
-            NULL
-        };
-
-        execv(path, args);
-
-        perror("execv /bin/sh failed");
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    enable_raw_mode();
-    raw_write("\033[?25l");
-
-    shell_print("\n[DewOS] Returned from shell.\n");
-}
-
-//------------------------------------------------------------------------------------//
-
-void cmd_su(const CommandContext& ctx) {
-    if (!rootfs_ready) {
-        shell_print("su: unavailable in live installer mode\n");
-        return;
-    }
-
-    if (ctx.args.empty()) {
-        shell_print("usage: su <user>\n");
-        return;
-    }
-
-    std::string username = ctx.args[0];
-
-    LoginUser user;
-
-    if (!load_user_from_files(username, user)) {
-        shell_print("su: user not found\n");
-        return;
-    }
-
-    disable_raw_mode();
-    raw_write("\033[?25h");
-
-    std::string password = read_password("password: ");
-
-    enable_raw_mode();
-    raw_write("\033[?25l");
-
-    if (!verify_password(password, user.password_hash)) {
-        shell_print("su: authentication failed\n");
-        return;
-    }
-
-    current_user = user.name;
-    current_uid = user.uid;
-    current_gid = user.gid;
-    current_home = user.home;
-
-    if (!current_home.empty()) {
-        if (chdir(current_home.c_str()) != 0) {
-            print_error("su: failed to change home directory");
-        }
-    }
-
-    shell_print("switched to " + current_user + "\n");
-}
-
-//------------------------------------------------------------------------------------//
-
-void start_network_if_installed() {
-    if (!rootfs_ready) {
-        return;
-    }
-
-    if (access("/sbin/netup", X_OK) != 0) {
-        return;
-    }
-
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        return;
-    }
-
-    if (pid == 0) {
-        int log = open("/tmp/netup.log", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-
-        if (log >= 0) {
-            dup2(log, 1);
-            dup2(log, 2);
-
-            if (log > 2) {
-                close(log);
-            }
-        }
-
-        const char* path = "/sbin/netup";
-
-        char* const args[] = {
-            (char*)path,
-            (char*)"eth0",
-            nullptr
-        };
-
-        execv(path, args);
-        _exit(127);
-    }
-}
-
-void cmd_netlog(const CommandContext& ctx) {
-    (void)ctx;
-
-    int fd = open("/tmp/netup.log", O_RDONLY);
-
-    if (fd < 0) {
-        shell_print("netlog: no network log found\n");
-        return;
-    }
-
-    char buffer[1024];
-    ssize_t n;
-
-    while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
-        shell_print(std::string(buffer, n));
-    }
-
-    close(fd);
-}
-
-//------------------------------------------------------------------------------------//
-
-void cmd_unknown(const CommandContext& ctx) {
-    shell_print("Unknown command: " + ctx.name + "\n");
+void hex_to_str(uint32_t n, char* out) {
+    const char* hex_chars = "0123456789ABCDEF";
+    
+    out[0] = '0';
+    out[1] = 'x';
+    
+    for (int i = 7; i >= 0; --i) {
+        out[i + 2] = hex_chars[n & 0xF];
+        n >>= 4;
+    }
+    
+    out[10] = '\0';
 }

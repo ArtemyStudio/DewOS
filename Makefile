@@ -1,35 +1,37 @@
-.PHONY: fetch-lfs fetch-kernel kernel initramfs rootfs run run-gui clean clean-builds build rebuild give-perm
+.PHONY: all check fetch kernel initramfs iso run run-direct clean clean-disk clean-all rebuild
 
-fetch-lfs:
-	./scripts/fetch-lfs-sources.sh
+all: iso
 
-fetch-kernel:
-	./scripts/fetch-kernel.sh
+check:
+	./scripts/check-all.sh
+
+fetch:
+	./scripts/fetch-src.sh all
 
 kernel:
-	./scripts/build-kernel.sh
+	./scripts/check-all.sh
 
 initramfs:
 	./scripts/build-initramfs.sh
 
-rootfs:
-	./scripts/build-rootfs-image.sh
-
-build: rootfs
-
-rebuild: fetch-kernel kernel initramfs rootfs
+iso:
+	./scripts/build-iso.sh
 
 run:
-	./scripts/run-qemu-gui.sh
+	./scripts/run.sh iso
 
-run-gui:
-	./scripts/run-qemu-gui.sh
+run-direct:
+	./scripts/run.sh direct
+
+rebuild:
+	./scripts/clear.sh build
+	./scripts/build-iso.sh
 
 clean:
-	./scripts/clean-builds.sh
+	./scripts/clear.sh build
 
-clean-builds:
-	./scripts/clean-builds.sh
+clean-disk:
+	./scripts/clear.sh disk
 
-give-perm:
-	chmod +x ./scripts/*.sh
+clean-all:
+	./scripts/clear.sh all

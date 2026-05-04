@@ -6,3 +6,13 @@ sources/lfs/*.tgz filter=lfs diff=lfs merge=lfs -text
 *.iso filter=lfs diff=lfs merge=lfs -text
 *.cpio.gz filter=lfs diff=lfs merge=lfs -text
 *.ext4 filter=lfs diff=lfs merge=lfs -text
+
+scripts/*.sh linguist-generated
+app/installer/*.sh linguist-generated
+
+sources/lfs/* linguist-vendored
+
+*.cpp linguist-language=C++
+*.hpp linguist-language=C++
+*.h linguist-language=C++
+*.c linguist-language=C
