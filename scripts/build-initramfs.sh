@@ -16,9 +16,49 @@ find_busybox() {
     echo /bin/busybox
   elif [ -x /usr/bin/busybox ]; then
     echo /usr/bin/busybox
+  elif command -v busybox >/dev/null 2>&1; then
+    command -v busybox
   else
     echo "[DewOS] Missing busybox. Run: ./scripts/check-all.sh" >&2
     exit 1
+  fi
+}
+
+patch_bin_libs() {
+  local dest="$1"
+  [ -x "$dest" ] || return 0
+
+  mkdir -p "$ROOT/lib" "$ROOT/lib64"
+
+  (ldd "$dest" 2>/dev/null || true) | while read -r line; do
+    local lib=""
+
+    case "$line" in
+      *"=>"*) lib="$(printf '%s\n' "$line" | awk '{print $3}')" ;;
+      /*) lib="$(printf '%s\n' "$line" | awk '{print $1}')" ;;
+    esac
+
+    if [ -n "$lib" ] && [ "$lib" != "not" ] && [ -f "$lib" ]; then
+      local libname
+      libname="$(basename "$lib")"
+      cp -n "$lib" "$ROOT/lib/$libname" 2>/dev/null || true
+      if [ ! -e "$ROOT/lib64/$libname" ]; then
+        ln -sf "/lib/$libname" "$ROOT/lib64/$libname" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  if command -v patchelf >/dev/null 2>&1; then
+    local interp
+    interp="$(patchelf --print-interpreter "$dest" 2>/dev/null || true)"
+    if [ -n "$interp" ]; then
+      local interp_name
+      interp_name="$(basename "$interp")"
+      if [ -f "$ROOT/lib/$interp_name" ]; then
+        patchelf --set-interpreter "/lib/$interp_name" "$dest" 2>/dev/null || true
+      fi
+    fi
+    patchelf --set-rpath "/lib:/lib64" "$dest" 2>/dev/null || true
   fi
 }
 
@@ -35,19 +75,7 @@ copy_bin_with_libs() {
   cp "$bin" "$dest"
   chmod +x "$dest"
 
-  (ldd "$bin" 2>/dev/null || true) | while read -r line; do
-    local lib=""
-
-    case "$line" in
-      *"=>"*) lib="$(printf '%s\n' "$line" | awk '{print $3}')" ;;
-      /*) lib="$(printf '%s\n' "$line" | awk '{print $1}')" ;;
-    esac
-
-    if [ -n "$lib" ] && [ -f "$lib" ]; then
-      mkdir -p "$ROOT$(dirname "$lib")"
-      cp "$lib" "$ROOT$lib" || true
-    fi
-  done
+  patch_bin_libs "$dest"
 }
 
 echo "[DewOS] Building initramfs tree..."
@@ -60,10 +88,11 @@ mkdir -p "$ROOT/var/drop/repo" "$ROOT/var/drop/installed"
 mkdir -p out
 
 echo "[DewOS] Building /init..."
-g++ -std=c++20 -Wall -Wextra -O2 -static \
+g++ -std=c++20 -Wall -Wextra -O2 \
   app/init/init.cpp app/init/shell.cpp app/init/system.cpp app/init/network.cpp \
   -o "$INIT_BIN"
 chmod +x "$INIT_BIN"
+copy_bin_with_libs "$INIT_BIN"
 
 echo "[DewOS] Adding BusyBox..."
 cp "$(find_busybox)" "$ROOT/bin/busybox"
@@ -96,20 +125,23 @@ done
 
 echo "[DewOS] Building TUI installer (dew-install)..."
 if [ -f "$INSTALLER_SRC" ]; then
-  g++ -std=c++20 -Wall -Wextra -O2 -static \
+  g++ -std=c++20 -Wall -Wextra -O2 \
     "$INSTALLER_SRC" -o "$INSTALLER_BIN"
   chmod +x "$INSTALLER_BIN"
+  patch_bin_libs "$INSTALLER_BIN"
 elif [ -f app/installer/dew-install ]; then
   cp app/installer/dew-install "$INSTALLER_BIN"
   chmod +x "$INSTALLER_BIN"
+  patch_bin_libs "$INSTALLER_BIN"
 else
   echo "[DewOS] WARNING: no installer source or binary found" >&2
 fi
 
 echo "[DewOS] Building drop package manager..."
 if [ -f "$DROP_SRC" ]; then
-  g++ -std=c++20 -Wall -Wextra -O2 -static "$DROP_SRC" -o "$DROP_BIN"
+  g++ -std=c++20 -Wall -Wextra -O2 "$DROP_SRC" -o "$DROP_BIN"
   chmod +x "$DROP_BIN"
+  patch_bin_libs "$DROP_BIN"
 fi
 
 if [ -x scripts/build-pkgs.sh ]; then

@@ -36,6 +36,7 @@ missing_command() {
 
 missing_package() {
   command -v dpkg >/dev/null 2>&1 || return 0
+  command -v apt-get >/dev/null 2>&1 || return 0
 
   for pkg in "$@"; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -107,14 +108,18 @@ kernel_config_ready() {
 MISSING_COMMANDS="$(missing_command "${COMMANDS[@]}")"
 MISSING_PACKAGES="$(missing_package "${PACKAGES[@]}")"
 
-if [ -n "$MISSING_COMMANDS" ] || [ -n "$MISSING_PACKAGES" ]; then
+if [ -n "$MISSING_COMMANDS" ]; then
   echo "[DewOS] Missing commands:"
-  printf '%s\n' "${MISSING_COMMANDS:-none}"
+  printf '%s\n' "$MISSING_COMMANDS"
 
-  echo "[DewOS] Missing packages:"
-  printf '%s\n' "${MISSING_PACKAGES:-unknown, checking by command only}"
+  if [ -n "$MISSING_PACKAGES" ]; then
+    echo "[DewOS] Missing packages:"
+    printf '%s\n' "$MISSING_PACKAGES"
+  fi
 
   install_packages
+elif [ -n "$MISSING_PACKAGES" ]; then
+  echo "[DewOS] All required commands are present (packages may differ by distro)."
 fi
 
 if [ ! -d "$KDIR" ] && [ ! -f "$KERNEL_OUT" ]; then
