@@ -1,12 +1,19 @@
 build/
 out/
+
 sources/
-third_party/
 
-*.img
-*.iso
-*.cpio.gz
-*.ext4
+build/pkgs-stage/
 
-.cache/
-.tmp/
+*.o
+*.a
+*.tmp
+*.log
+
+app/bin
+app/sbin
+
+!thirdparty/
+
+.DS_Store
+Thimbs.db
