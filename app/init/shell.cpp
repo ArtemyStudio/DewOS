@@ -20,7 +20,6 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 
-
 termios original_termios;
 std::vector<std::string> history;
 size_t history_index = 0;
@@ -32,7 +31,6 @@ struct ShellOutput {
 };
 
 static ShellOutput shell_output;
-
 
 void shell_loop() {
     std::vector<Command> commands = create_commands();
@@ -50,7 +48,6 @@ void shell_loop() {
         exec_command(ctx, commands);
     }
 }
-
 
 CommandContext parse_command(const std::string& input) {
     CommandContext ctx;
@@ -73,7 +70,6 @@ CommandContext parse_command(const std::string& input) {
 
     return ctx;
 }
-
 
 std::vector<Command> create_commands() {
     std::vector<Command> commands;
@@ -106,10 +102,10 @@ std::vector<Command> create_commands() {
     commands.push_back(Command{"wifi-connect-debug", "Connect Wi-Fi with debug output", cmd_wifi_connect_debug});
     commands.push_back(Command{"net-test", "Run network connectivity checks", cmd_net_test});
     commands.push_back(Command{"network", "Network status, scan, DHCP and debug connect", cmd_network});
+    commands.push_back(Command{"drop", "Package manager (drop install/remove/list/search)", cmd_drop});
 
     return commands;
 }
-
 
 void exec_command(const CommandContext& ctx, const std::vector<Command>& commands) {
     if (ctx.name.empty()) {
@@ -125,11 +121,6 @@ void exec_command(const CommandContext& ctx, const std::vector<Command>& command
 
     unknown_command(ctx);
 }
-
-
-//#######################################################################################//
-//######                            COMMANDS                                       ######//
-//#######################################################################################//
 
 void cmd_about(const CommandContext& ctx) {
     (void)ctx;
@@ -150,12 +141,10 @@ void cmd_help(const CommandContext& ctx, const std::vector<Command>& commands) {
     }
 }
 
-
 void cmd_clear(const CommandContext& ctx) {
     (void)ctx;
     shell_print("\033[2J\033[H");
 }
-
 
 void cmd_echo(const CommandContext& ctx) {
     for (const std::string& arg : ctx.args) {
@@ -164,7 +153,6 @@ void cmd_echo(const CommandContext& ctx) {
 
     shell_print("\n");
 }
-
 
 void cmd_install(const CommandContext& ctx) {
     (void)ctx;
@@ -207,7 +195,6 @@ void cmd_install(const CommandContext& ctx) {
     rootfs_ready = detect_rootfs();
 }
 
-
 void print_banner() {
     shell_print("██████╗ ███████╗██╗    ██╗ ██████╗ ███████╗\n");
     shell_print("██╔══██╗██╔════╝██║    ██║██╔═══██╗██╔════╝\n");
@@ -218,15 +205,8 @@ void print_banner() {
     shell_print("\n");
 }
 
-
-//#######################################################################################//
-//######                             FS COMMANDS                                   ######//
-//#######################################################################################//
-
 void cmd_pwd(const CommandContext& ctx) {
     (void)ctx;
-
-    if (!require_rootfs("pwd")) return;
 
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) != nullptr) {
@@ -238,8 +218,6 @@ void cmd_pwd(const CommandContext& ctx) {
 
 void cmd_ls(const CommandContext& ctx) {
     (void)ctx;
-
-    if (!require_rootfs("ls")) return;
 
     std::string path = ctx.args.empty() ? "." : ctx.args[0];
 
@@ -259,8 +237,6 @@ void cmd_ls(const CommandContext& ctx) {
 }
 
 void cmd_cd(const CommandContext& ctx) {
-    if (!require_rootfs("cd")) return;
-
     if (ctx.args.empty()) {
         print_error("No directory specified");
         return;
@@ -272,8 +248,6 @@ void cmd_cd(const CommandContext& ctx) {
 }
 
 void cmd_mkdir(const CommandContext& ctx) {
-    if (!require_rootfs("mkdir")) return;
-
     if (ctx.args.empty()) {
         print_error("No directory name specified");
         return;
@@ -285,8 +259,6 @@ void cmd_mkdir(const CommandContext& ctx) {
 }
 
 void cmd_touch(const CommandContext& ctx) {
-    if (!require_rootfs("touch")) return;
-
     if (ctx.args.empty()) {
         print_error("No file name specified");
         return;
@@ -301,27 +273,34 @@ void cmd_touch(const CommandContext& ctx) {
 }
 
 void cmd_rm(const CommandContext& ctx) {
-    if (!require_rootfs("rm")) return;
-
     if (ctx.args.empty()) {
         print_error("No file or directory specified");
         return;
     }
 
-    const char* path = ctx.args[0].c_str();
+    const std::string& path = ctx.args[0];
 
-    if (ctx.has_flag("-r")) {
-        shell_print("Recursively removing directory is not implemented yet.\n");
-    } else {
-        if (remove(path) < 0) {
-            print_error("Failed to remove file or directory");
+    if (ctx.has_flag("-r") || ctx.has_flag("-rf") || ctx.has_flag("-fr")) {
+        disable_raw_mode();
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/bin/rm", "rm", "-rf", path.c_str(), nullptr);
+            _exit(127);
         }
+        if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+        }
+        enable_raw_mode();
+        return;
+    }
+
+    if (remove(path.c_str()) < 0) {
+        print_error("Failed to remove file or directory");
     }
 }
 
 void cmd_cat(const CommandContext& ctx) {
-    if (!require_rootfs("cat")) return;
-
     if (ctx.args.empty()) {
         print_error("No file specified");
         return;
@@ -344,11 +323,6 @@ void cmd_cat(const CommandContext& ctx) {
     close(fd);
 }
 
-
-//#######################################################################################//
-//######                                KILO                                       ######//
-//#######################################################################################//
-
 void cmd_kilo(const CommandContext& ctx) {
     if (ctx.args.empty()) {
         print_error("kilo: missing file");
@@ -357,7 +331,6 @@ void cmd_kilo(const CommandContext& ctx) {
 
     kilo_editor(ctx, ctx.args[0].c_str());
 }
-
 
 void kilo_editor(const CommandContext& ctx, const char* filename) {
     (void)ctx;
@@ -413,11 +386,6 @@ void kilo_editor(const CommandContext& ctx, const char* filename) {
     shell_print("Returned to DewOS Init.\n");
 }
 
-
-//#######################################################################################//
-//######                            DEWFETCH x PS                                  ######//
-//#######################################################################################//
-
 void cmd_dewfetch(const CommandContext& ctx) {
     (void)ctx;
     struct utsname sys;
@@ -457,11 +425,16 @@ void cmd_dewfetch(const CommandContext& ctx) {
     }
 
     int pkg_count = 0;
-    DIR* dir = opendir("/usr/bin");
-    if (dir) {
-        while (readdir(dir)) pkg_count++;
-        closedir(dir);
-        if (pkg_count > 2) pkg_count -= 2;
+    DIR* drop_dir = opendir("/var/drop/installed");
+    if (drop_dir) {
+        while (struct dirent* e = readdir(drop_dir)) {
+            std::string n = e->d_name;
+            if (n == "." || n == "..") continue;
+            // skip .meta files — count only main entries
+            if (n.size() >= 5 && n.substr(n.size() - 5) == ".meta") continue;
+            pkg_count++;
+        }
+        closedir(drop_dir);
     }
 
     std::vector<std::string> logo = {
@@ -495,7 +468,7 @@ void cmd_dewfetch(const CommandContext& ctx) {
             case 3:  shell_print("   " + std::string(BOLD) + BLUE + "os     " + RESET + "DewOS"); break;
             case 4:  shell_print("  " + std::string(BOLD) + BLUE + "kernel " + RESET + sys.release); break;
             case 5:  shell_print("  " + std::string(BOLD) + BLUE + "uptime " + RESET + uptime_str); break;
-            case 6:  shell_print("  " + std::string(BOLD) + BLUE + "pkgs   " + RESET + std::to_string(pkg_count) + " (bin)"); break;
+            case 6:  shell_print("  " + std::string(BOLD) + BLUE + "pkgs   " + RESET + std::to_string(pkg_count) + " (drop)"); break;
             case 7:  shell_print("  " + std::string(BOLD) + BLUE + "memory " + RESET + mem_str); break;
             case 9:  shell_print("  " + std::string("\033[41m  \033[42m  \033[43m  \033[44m  \033[45m  \033[0m")); break;
         }
@@ -505,7 +478,6 @@ void cmd_dewfetch(const CommandContext& ctx) {
 
     shell_print("\n");
 }
-
 
 void cmd_ps(const CommandContext& ctx) {
     (void)ctx;
@@ -568,12 +540,6 @@ void cmd_ps(const CommandContext& ctx) {
     shell_print(std::string(BOLD) + CYN + "╰──────────┴──────────────────────┴────────────┴──────────────────────╯" + RESET + "\n");
     closedir(dir);
 }
-
-
-//#######################################################################################//
-//######                            RAW MODE                                       ######//
-//#######################################################################################//
-
 
 void enable_raw_mode() {
     if (tcgetattr(0, &original_termios) < 0) {
@@ -707,7 +673,6 @@ std::string read_line(const std::string& prompt) {
     }
 }
 
-
 void redraw_line(const std::string& prompt, const std::string& line, size_t cursor, bool cursor_visible) {
     if (cursor > line.size()) {
         cursor = line.size();
@@ -738,7 +703,6 @@ void redraw_line(const std::string& prompt, const std::string& line, size_t curs
     }
 }
 
-
 void raw_write(const std::string& text) {
     const char* data = text.data();
     size_t left = text.size();
@@ -758,11 +722,6 @@ void raw_write(const std::string& text) {
         left -= static_cast<size_t>(written);
     }
 }
-
-
-//#######################################################################################//
-//######                            SHELL PRINTING                                 ######//
-//#######################################################################################//
 
 void shell_print(const std::string& text) {
     for (char c : text) {
@@ -792,11 +751,6 @@ void shell_print(const std::string& text) {
     raw_write(text);
 }
 
-
-//#######################################################################################//
-//######                            ROOTFS DETECTION                               ######//
-//#######################################################################################//
-
 bool detect_rootfs() {
     return access("/etc/dewos-installed", F_OK) == 0;
 }
@@ -809,11 +763,6 @@ bool require_rootfs(const std::string& command_name) {
     shell_print(command_name + ": unavailable before install/rootfs mount\n");
     return false;
 }
-
-
-//#######################################################################################//
-//######                            BUSYBOX SHELL                                  ######//
-//#######################################################################################//
 
 void cmd_sh(const CommandContext& ctx) {
     (void)ctx;
@@ -853,11 +802,6 @@ void cmd_sh(const CommandContext& ctx) {
 
     shell_print("\n[DewOS] Returned from shell\n");
 }
-
-
-//#######################################################################################//
-//######                             NETWORK LOG                                   ######//
-//#######################################################################################//
 
 void start_network_if_installed() {
     if (!rootfs_ready) {
@@ -932,7 +876,6 @@ void start_network_if_installed() {
     }
 }
 
-
 void cmd_netlog(const CommandContext& ctx) {
     (void)ctx;
 
@@ -953,10 +896,39 @@ void cmd_netlog(const CommandContext& ctx) {
     close(fd);
 }
 
+void cmd_drop(const CommandContext& ctx) {
+    disable_raw_mode();
+    raw_write("\033[?25h");
 
-//#######################################################################################//
-//######                             UNKNOWN COMMAND                               ######//
-//#######################################################################################//
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        shell_print("[DewOS] fork failed\n");
+        enable_raw_mode();
+        raw_write("\033[?25l");
+        return;
+    }
+
+    if (pid == 0) {
+        std::vector<std::string> argv = {"drop"};
+        for (const auto& f : ctx.flags) argv.push_back(f);
+        for (const auto& a : ctx.args) argv.push_back(a);
+
+        std::vector<char*> cargs;
+        for (auto& s : argv) cargs.push_back(const_cast<char*>(s.c_str()));
+        cargs.push_back(nullptr);
+
+        execv("/bin/drop", cargs.data());
+        perror("execv /bin/drop failed");
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    enable_raw_mode();
+    raw_write("\033[?25l");
+}
 
 void unknown_command(const CommandContext& ctx) {
     shell_print("Unknown command: " + ctx.name + "\n");

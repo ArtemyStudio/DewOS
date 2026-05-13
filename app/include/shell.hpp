@@ -72,6 +72,7 @@ bool detect_rootfs();
 bool require_rootfs(const std::string& command_name);
 
 void cmd_sh(const CommandContext& ctx);
+void cmd_drop(const CommandContext& ctx);
 
 void start_network_if_installed();
 void cmd_netlog(const CommandContext& ctx);

@@ -21,7 +21,6 @@
 
 bool rootfs_ready = false;
 
-
 int main() {
     setup_console();
     raw_write("\033[?25l");
@@ -92,7 +91,6 @@ int main() {
 
     return 0;
 }
-
 
 void show_boot_splash() {
     int fb = open("/dev/fb0", O_RDWR);
@@ -411,11 +409,6 @@ void show_boot_splash() {
     raw_write("\033[2J\033[H");
 }
 
-
-//#######################################################################################//
-//######                             CONSOLE SETUP                                 ######//
-//#######################################################################################//
-
 void setup_console() {
     mkdir("/dev", 0755);
     
@@ -454,7 +447,6 @@ void setup_console() {
     }
 }
 
-
 void mount_basic_fs() {
     mkdir("/proc", 0555);
     mkdir("/sys", 0555);
@@ -474,15 +466,9 @@ void mount_basic_fs() {
     }
 }
 
-
-//#######################################################################################//
-//######                             CRITICAL ERRORS                               ######//
-//#######################################################################################//
-
 void print_error(const std::string& message) {
     std::cerr << "ERROR: " << message << std::endl;
 }
-
 
 void critical_error(const char* message, uint32_t error_code) {
     uint16_t* vga = (uint16_t*)0xB8000;
@@ -537,7 +523,6 @@ void emergency_print(const char* str, int x, int y, uint8_t color) {
         vga[offset + i] = (uint16_t)str[i] | ((uint16_t)color << 8);
     }
 }
-
 
 void hex_to_str(uint32_t n, char* out) {
     const char* hex_chars = "0123456789ABCDEF";

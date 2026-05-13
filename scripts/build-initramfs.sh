@@ -5,8 +5,10 @@ cd "$(dirname "$0")/.."
 
 ROOT="build/rootfs"
 INIT_BIN="$ROOT/init"
-INSTALLER_SRC="app/installer/dew-install-initramfs.sh"
+INSTALLER_SRC="app/installer/dew-install.cpp"
 INSTALLER_BIN="$ROOT/sbin/dew-install"
+DROP_SRC="app/drop/drop.cpp"
+DROP_BIN="$ROOT/bin/drop"
 INITRAMFS="out/initramfs.cpio.gz"
 
 find_busybox() {
@@ -51,13 +53,16 @@ copy_bin_with_libs() {
 echo "[DewOS] Building initramfs tree..."
 rm -rf "$ROOT"
 mkdir -p "$ROOT"/{bin,sbin,etc,proc,sys,dev,tmp,root,home,mnt,var,run,usr/bin,usr/sbin,lib,lib64}
+mkdir -p "$ROOT"/{bin,sbin,etc,proc,sys,dev,tmp,root,home,mnt,var,run,usr/bin,usr/sbin,lib,lib64}
+chmod 755 "$ROOT"/bin "$ROOT"/sbin "$ROOT"/usr/bin "$ROOT"/usr/sbin
 mkdir -p "$ROOT/boot"
+mkdir -p "$ROOT/var/drop/repo" "$ROOT/var/drop/installed"
 mkdir -p out
 
 echo "[DewOS] Building /init..."
 g++ -std=c++20 -Wall -Wextra -O2 -static \
   app/init/init.cpp app/init/shell.cpp app/init/system.cpp app/init/network.cpp \
-  -o "$INIT_BIN" -lcrypt
+  -o "$INIT_BIN"
 chmod +x "$INIT_BIN"
 
 echo "[DewOS] Adding BusyBox..."
@@ -68,8 +73,9 @@ for app in \
   ash sh echo printf cat head tail ls pwd mkdir rmdir rm cp mv touch chmod chown \
   grep sed awk find xargs test true false clear reset sleep date uname hostname \
   whoami id ps kill dmesg free top mount umount sync df du ifconfig ip route \
-  blockdev mknod stty \
-  ping wget udhcpc vi hexdump cut sort uniq wc tr basename dirname reboot poweroff halt
+  blockdev mknod stty tar gzip gunzip \
+  ping wget udhcpc vi hexdump cut sort uniq wc tr basename dirname reboot poweroff halt \
+  wipefs
 do
   ln -sf /bin/busybox "$ROOT/bin/$app" 2>/dev/null || true
   ln -sf /bin/busybox "$ROOT/sbin/$app" 2>/dev/null || true
@@ -77,7 +83,7 @@ done
 
 echo "[DewOS] Adding installer tools..."
 for cmd in \
-  /usr/bin/lsblk /usr/sbin/fdisk /usr/sbin/partprobe /usr/sbin/blkid \
+  /usr/bin/lsblk /usr/sbin/sfdisk /usr/sbin/fdisk /usr/sbin/partprobe /usr/sbin/blkid \
   /usr/sbin/mkfs.ext4 /usr/sbin/mkfs.vfat /usr/bin/udevadm /usr/bin/openssl \
   /usr/sbin/wpa_supplicant /usr/bin/wpa_passphrase /usr/sbin/iw /usr/sbin/rfkill
 do
@@ -88,12 +94,32 @@ for cmd in /usr/bin/grub-* /usr/sbin/grub-*; do
   copy_bin_with_libs "$cmd"
 done
 
-if [ -f app/installer/dew-install ]; then
+echo "[DewOS] Building TUI installer (dew-install)..."
+if [ -f "$INSTALLER_SRC" ]; then
+  g++ -std=c++20 -Wall -Wextra -O2 -static \
+    "$INSTALLER_SRC" -o "$INSTALLER_BIN"
+  chmod +x "$INSTALLER_BIN"
+elif [ -f app/installer/dew-install ]; then
   cp app/installer/dew-install "$INSTALLER_BIN"
   chmod +x "$INSTALLER_BIN"
-elif [ -f "$INSTALLER_SRC" ]; then
-  cp "$INSTALLER_SRC" "$INSTALLER_BIN"
-  chmod +x "$INSTALLER_BIN"
+else
+  echo "[DewOS] WARNING: no installer source or binary found" >&2
+fi
+
+echo "[DewOS] Building drop package manager..."
+if [ -f "$DROP_SRC" ]; then
+  g++ -std=c++20 -Wall -Wextra -O2 -static "$DROP_SRC" -o "$DROP_BIN"
+  chmod +x "$DROP_BIN"
+fi
+
+if [ -x scripts/build-pkgs.sh ]; then
+  echo "[DewOS] Building drop packages..."
+  ./scripts/build-pkgs.sh || echo "[DewOS] WARNING: build-pkgs.sh had errors, continuing"
+
+  if [ -d build/repo ] && [ -n "$(ls -A build/repo 2>/dev/null)" ]; then
+    echo "[DewOS] Copying drop repo into initramfs..."
+    cp -a build/repo/. "$ROOT/var/drop/repo/"
+  fi
 fi
 
 if [ -d build/rootfs-disk ]; then

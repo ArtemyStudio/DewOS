@@ -34,7 +34,6 @@ static bool file_exists(const std::string& path) {
     return access(path.c_str(), F_OK) == 0;
 }
 
-
 static std::string trim(const std::string& text) {
     size_t start = 0;
     size_t end = text.size();
@@ -50,7 +49,6 @@ static std::string trim(const std::string& text) {
     return text.substr(start, end - start);
 }
 
-
 static std::vector<std::string> split_lines(const std::string& text) {
     std::vector<std::string> lines;
     std::stringstream ss(text);
@@ -63,7 +61,6 @@ static std::vector<std::string> split_lines(const std::string& text) {
     return lines;
 }
 
-
 static std::string read_first_line(const std::string& path) {
     std::ifstream file(path);
     std::string line;
@@ -74,11 +71,6 @@ static std::string read_first_line(const std::string& path) {
 
     return trim(line);
 }
-
-
-//#######################################################################################//
-//######                             COMMANDS                                       ######//
-//#######################################################################################//
 
 static std::string find_command(const std::string& name) {
     const char* dirs[] = {"/bin", "/sbin", "/usr/bin", "/usr/sbin"};
@@ -94,11 +86,9 @@ static std::string find_command(const std::string& name) {
     return "";
 }
 
-
 static bool command_exists(const std::string& name) {
     return !find_command(name).empty();
 }
-
 
 static RunResult run_command(const std::vector<std::string>& args) {
     RunResult result;
@@ -174,7 +164,6 @@ static RunResult run_command(const std::vector<std::string>& args) {
     return result;
 }
 
-
 static void print_command(const std::vector<std::string>& args) {
     if (args.empty()) {
         return;
@@ -203,11 +192,6 @@ static void print_command(const std::vector<std::string>& args) {
     }
 }
 
-
-//#######################################################################################//
-//######                             DRIVER DETECTION                              ######//
-//#######################################################################################//
-
 static std::string driver_for_interface(const std::string& iface) {
     std::string path = "/sys/class/net/" + iface + "/device/driver";
     char link_target[512];
@@ -228,12 +212,10 @@ static std::string driver_for_interface(const std::string& iface) {
     return driver.empty() ? "unknown" : driver;
 }
 
-
 static bool interface_is_wifi(const std::string& iface) {
     std::string base = "/sys/class/net/" + iface;
     return file_exists(base + "/wireless") || file_exists(base + "/phy80211");
 }
-
 
 static std::vector<NetInterface> list_interfaces() {
     std::vector<NetInterface> interfaces;
@@ -269,11 +251,6 @@ static std::vector<NetInterface> list_interfaces() {
     return interfaces;
 }
 
-
-//#######################################################################################//
-//######                             WIFI DETECTION                                 ######//
-//#######################################################################################//
-
 static std::string first_wifi_interface() {
     for (const NetInterface& iface : list_interfaces()) {
         if (iface.wifi) {
@@ -296,7 +273,6 @@ static std::string first_wifi_interface() {
     return "";
 }
 
-
 static std::string first_network_interface() {
     for (const NetInterface& iface : list_interfaces()) {
         if (iface.name != "lo") {
@@ -306,11 +282,6 @@ static std::string first_network_interface() {
 
     return "";
 }
-
-
-//#######################################################################################//
-//######                             SHELL ESCAPE                                  ######//
-//#######################################################################################//
 
 static std::string shell_escape_config(const std::string& value) {
     std::string escaped;
@@ -325,7 +296,6 @@ static std::string shell_escape_config(const std::string& value) {
 
     return escaped;
 }
-
 
 static void kill_wpa_supplicant() {
     DIR* dir = opendir("/proc");
@@ -353,7 +323,6 @@ static void kill_wpa_supplicant() {
     usleep(300000);
 }
 
-
 static void print_tool_status() {
     const char* tools[] = {"ip", "iw", "rfkill", "wpa_supplicant", "wpa_passphrase", "udhcpc", "wget", "ping"};
 
@@ -367,7 +336,6 @@ static void print_tool_status() {
         shell_print("\n");
     }
 }
-
 
 static void print_interfaces() {
     std::vector<NetInterface> interfaces = list_interfaces();
@@ -390,7 +358,6 @@ static void print_interfaces() {
     }
 }
 
-
 static bool has_ipv4(const std::string& iface) {
     std::vector<std::string> args = {"ip", "-4", "addr", "show"};
 
@@ -402,12 +369,10 @@ static bool has_ipv4(const std::string& iface) {
     return result.output.find(" inet ") != std::string::npos;
 }
 
-
 static bool has_default_route() {
     RunResult result = run_command({"ip", "route"});
     return result.output.find("default ") != std::string::npos;
 }
-
 
 static bool has_dns() {
     std::ifstream file("/etc/resolv.conf");
@@ -423,11 +388,6 @@ static bool has_dns() {
 
     return false;
 }
-
-
-//#######################################################################################//
-//######                             NETWORK TEST                                  ######//
-//#######################################################################################//
 
 static bool run_network_test(const std::string& iface, bool verbose) {
     bool ok = true;
@@ -475,7 +435,6 @@ static bool run_network_test(const std::string& iface, bool verbose) {
 
     return ok;
 }
-
 
 static void scan_wifi(const std::string& requested_iface) {
     std::string iface = requested_iface.empty() ? first_wifi_interface() : requested_iface;
@@ -567,7 +526,6 @@ static void scan_wifi(const std::string& requested_iface) {
     }
 }
 
-
 static void request_dhcp(const std::string& iface) {
     std::string real_iface = iface.empty() ? first_network_interface() : iface;
 
@@ -584,11 +542,6 @@ static void request_dhcp(const std::string& iface) {
         print_command({"udhcpc", "-i", real_iface, "-q", "-n"});
     }
 }
-
-
-//#######################################################################################//
-//######                             CMD COMMANDS                                  ######//
-//#######################################################################################//
 
 void cmd_wifi_detect(const CommandContext& ctx) {
     (void)ctx;
@@ -608,12 +561,10 @@ void cmd_wifi_detect(const CommandContext& ctx) {
     }
 }
 
-
 void cmd_wifi_scan(const CommandContext& ctx) {
     std::string iface = ctx.args.empty() ? "" : ctx.args[0];
     scan_wifi(iface);
 }
-
 
 void cmd_wifi_connect_debug(const CommandContext& ctx) {
     std::string iface = first_wifi_interface();
@@ -723,7 +674,6 @@ void cmd_wifi_connect_debug(const CommandContext& ctx) {
     print_command({"tail", "-n", "40", "/tmp/wifi-connect-debug.log"});
 }
 
-
 void cmd_net_test(const CommandContext& ctx) {
     std::string iface = ctx.args.empty() ? "" : ctx.args[0];
     bool ok = run_network_test(iface, true);
@@ -732,7 +682,6 @@ void cmd_net_test(const CommandContext& ctx) {
     shell_print(ok ? std::string(GNR) + "ok" + RESET : std::string(RED) + "failed" + RESET);
     shell_print("\n");
 }
-
 
 void cmd_network(const CommandContext& ctx) {
     if (ctx.args.empty() || ctx.args[0] == "status") {

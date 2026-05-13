@@ -1,4 +1,4 @@
-.PHONY: all check fetch kernel initramfs iso run run-direct clean clean-disk clean-all rebuild
+.PHONY: all iso initramfs kernel pkgs check fetch run run-direct run-disk clean clean-disk clean-all rebuild
 
 all: iso
 
@@ -8,24 +8,31 @@ check:
 fetch:
 	./scripts/fetch-src.sh all
 
+fetch-kernel:
+	./scripts/fetch-src.sh kernel
+
 kernel:
-	./scripts/check-all.sh
+	DEW_REBUILD_KERNEL=1 ./scripts/check-all.sh
+
+pkgs:
+	./scripts/build-pkgs.sh
 
 initramfs:
 	./scripts/build-initramfs.sh
 
-iso:
+iso: check initramfs
 	./scripts/build-iso.sh
 
 run:
 	./scripts/run.sh iso
 
+run-disk:
+	./scripts/run.sh disk
+
 run-direct:
 	./scripts/run.sh direct
 
-rebuild:
-	./scripts/clear.sh build
-	./scripts/build-iso.sh
+rebuild: clean iso
 
 clean:
 	./scripts/clear.sh build
