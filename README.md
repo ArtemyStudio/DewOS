@@ -1,8 +1,6 @@
 # DewOS
 
-**DewOS** is a small experimental Linux-based OS project.
-
-It is built around a custom C++ `/init`, a small shell, an initramfs live environment, a TUI installer, GRUB boot support, QEMU testing, and a minimal installed root filesystem.
+**DewOS** is a small Linux distribution built around a custom C++ `/init`, a small shell, an initramfs live environment, a TUI installer, GRUB boot support, QEMU testing, and a minimal installed root filesystem.
 
 This is not a production-ready OS. It is a learning project, a system experiment, and a slow attempt to make a Linux distribution.
 
@@ -11,7 +9,6 @@ This is not a production-ready OS. It is a learning project, a system experiment
 DewOS is currently in early development.
 
 Working or partially working:
-
 - Custom C++ `/init`
 - Basic shell and login flow
 - Initramfs live environment
@@ -36,13 +33,13 @@ Not ready yet:
 
 ```txt
 DewOS/
-├── app/                  # Custom init, shell, installer and runtime files
+├── app/                  # Custom init, shell, installer, package manager, etc.
 ├── assets/               # Boot logos and visual assets
 ├── config/               # GRUB and system config files
 ├── configs/kernel/       # Kernel configuration helpers
-├── docs/                 # Notes and documentation
+├── docs/                 # Notes and documentation (nothing here yet)
 ├── scripts/              # Fetch, check, build, clean and run scripts
-├── thirdparty/           # Small vendored tools kept in Git
+├── thirdparty/           # Kilo (text editor), packages (for drop), etc.
 ├── Makefile
 └── README.md
 ```
